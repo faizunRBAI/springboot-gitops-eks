@@ -38,8 +38,7 @@ stages:
           find app/target/surefire-reports -name '*.txt' -exec cat {} + >> "$GITHUB_STEP_SUMMARY" || true
 
   # PROVISION RUNS BEFORE BUILD_PUSH.
-  # Terraform creates the ECR repository that build_push pushes to. Building
-  # first would mean pushing to a registry that does not exist yet.
+  # Terraform creates the ECR repository that build_push pushes to.
   - id: provision
     kind: provision
     needs: [test]
@@ -92,9 +91,6 @@ stages:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.8
-      # Read the ECR URL from state rather than reconstructing it from a name
-      # pattern. This job is self-sufficient: it does not consume job outputs
-      # from provision, which GitHub would drop because they embed PROJECT_NAME.
       - name: Read the ECR repository URL from terraform state
         id: tf
         working-directory: infra
@@ -114,8 +110,6 @@ stages:
       - name: Build image
         working-directory: app
         run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
-      # Show the accepted exceptions in the log on every run.
-      # A suppression nobody sees is a suppression nobody reviews.
       - name: Show accepted vulnerability exceptions
         run: |
           set -euo pipefail
@@ -123,23 +117,11 @@ stages:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -v '^\s*#' app/.trivyignore | grep -v '^\s*$' >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "See app/.trivyignore for the justification and review date."
           cat app/.trivyignore
-      # Sole pre-push vulnerability gate. Scans OS packages AND the Spring Boot
-      # JARs inside the image, so Java CVEs are caught at the deployed artifact.
-      # exit-code 1: a HIGH/CRITICAL finding fails the build before any push.
-      #
-      # trivyignores points at app/.trivyignore explicitly: this step runs from
-      # the repository ROOT, so Trivy would not find a file living under app/.
-      # That file suppresses THREE named CVE IDs only; the severity threshold
-      # is untouched and every other HIGH/CRITICAL still fails the build.
-      #
-      # DO NOT ADD a `version:` input here. Pinning the scanner version makes
-      # the action write the binary to $HOME/.local/bin/trivy-bin WITHOUT
-      # creating that directory, and the installer exits 1 immediately after
-      # reporting "found version". Likewise do not pin the action to a numeric
-      # tag: a nonexistent tag fails GitHub's pre-flight resolution and the job
-      # never starts.
+      # Sole pre-push vulnerability gate. exit-code 1 means a HIGH/CRITICAL
+      # finding fails the build before the image reaches ECR.
+      # DO NOT add a `version:` input (breaks the installer's write path) and
+      # do not pin the action to a numeric tag (pre-flight resolution fails).
       - name: Scan image with Trivy
         uses: aquasecurity/trivy-action@master
         with:
@@ -149,30 +131,9 @@ stages:
           severity: HIGH,CRITICAL
           ignore-unfixed: "true"
           trivyignores: app/.trivyignore
-      # ---------------------------------------------------------------------
-      # AUTHENTICATION: platform-injected static credentials.
-      #
-      # GitHub OIDC was the design intent and the terraform for it still
-      # exists (infra/oidc.tf: provider + repo-scoped role). It cannot be used
-      # from this pipeline because OIDC requires `permissions: id-token: write`
-      # on the job, and the platform's pipeline spec has no `permissions` key —
-      # verified: write_pipeline REFUSES it with
-      #   unknown key 'permissions' — allowed: [approval, env, id, kind,
-      #   needs, outputs, steps, timeout_minutes]
-      # Workflow files are rendered from the spec, so this cannot be patched by
-      # hand either.
-      #
-      # These static keys were ALREADY in this job's env for terraform state
-      # access, so using them for ECR adds no new credential exposure. When the
-      # platform gains a permissions field, restore the OIDC step:
-      #   - uses: aws-actions/configure-aws-credentials@v4
-      #     with:
-      #       role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
-      #       aws-region: us-east-1
-      #       unset-current-credentials: "true"
-      # and delete this note. The IAM role is already provisioned and scoped to
-      # repo:<owner>/<repo>:ref:refs/heads/main.
-      # ---------------------------------------------------------------------
+      # Authentication uses the platform's injected static credentials. OIDC
+      # needs `permissions: id-token: write`, which the pipeline spec cannot
+      # express — see the header of infra/oidc.tf for the restore procedure.
       - name: Confirm the AWS identity in use
         run: |
           set -euo pipefail
@@ -226,8 +187,20 @@ stages:
             -backend-config="region=us-east-1"
           echo "cluster_name=$(terraform output -raw cluster_name)" >> "$GITHUB_OUTPUT"
           echo "lbc_role_arn=$(terraform output -raw lbc_role_arn)" >> "$GITHUB_OUTPUT"
+          echo "vpc_id=$(terraform output -raw vpc_id)" >> "$GITHUB_OUTPUT"
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "${{ steps.tf.outputs.cluster_name }}" --region us-east-1
+      # vpcId IS MANDATORY HERE.
+      # Without it the controller discovers its VPC by calling EC2 IMDS from
+      # inside the pod. EKS nodes default to IMDSv2 with a hop limit of 1, and
+      # a pod-originated call takes one hop too many, so IMDS never answers:
+      #   "unable to initialize AWS cloud", "failed to get VPC ID: ...
+      #    ec2imds: GetMetadata, canceled, context deadline exceeded"
+      # The pods then CrashLoopBackOff and helm --wait reports only the
+      # unhelpful "Error: context deadline exceeded".
+      # Passing the VPC ID explicitly avoids IMDS entirely. Do NOT instead
+      # raise the node hop limit to 2 — that exposes the node's instance
+      # credentials to every pod on the host.
       - name: Install AWS Load Balancer Controller
         run: |
           set -euo pipefail
@@ -240,10 +213,15 @@ stages:
           helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
             --version 1.10.1 --namespace kube-system \
             --set clusterName="${{ steps.tf.outputs.cluster_name }}" \
+            --set region=us-east-1 \
+            --set vpcId="${{ steps.tf.outputs.vpc_id }}" \
             --set serviceAccount.create=false \
             --set serviceAccount.name=aws-load-balancer-controller \
-            --set region=us-east-1 \
-            --wait --timeout 10m
+            --wait --timeout 15m
+      - name: Show controller state if it did not settle
+        run: |
+          set -euo pipefail
+          kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o wide
       - name: Install Argo Rollouts controller
         run: |
           set -euo pipefail
@@ -251,7 +229,7 @@ stages:
           helm repo update
           helm upgrade --install argo-rollouts argo/argo-rollouts \
             --version 2.38.2 --namespace argo-rollouts --create-namespace \
-            --wait --timeout 10m
+            --wait --timeout 15m
       - name: Install kube-prometheus-stack
         run: |
           set -euo pipefail
@@ -261,7 +239,7 @@ stages:
             --version 66.3.1 --namespace monitoring --create-namespace \
             --values gitops/values/monitoring-values.yaml \
             --set grafana.adminPassword="${{ secrets.GRAFANA_ADMIN_PASSWORD }}" \
-            --wait --timeout 15m
+            --wait --timeout 20m
       - name: Install ArgoCD
         run: |
           set -euo pipefail
@@ -297,15 +275,13 @@ stages:
             echo "GitOps values already current; nothing to commit."
           else
             git add gitops/application-values.yaml
-            # [skip ci] is loop-prevention layer 1: this commit must never
-            # start another delivery run.
+            # [skip ci] is loop-prevention layer 1.
             git commit -m "chore(gitops): pin image tag ${GITHUB_SHA::12} [skip ci]"
             git push origin HEAD:main
           fi
-      # NOTE: no ArgoCD repository credential is registered. The monorepo is
-      # PUBLIC, so ArgoCD clones it anonymously. Creating a credential secret
-      # with an empty token would be worse than none: ArgoCD would attempt
-      # authenticated clones and fail.
+      # No ArgoCD repository credential: the monorepo is PUBLIC and ArgoCD
+      # clones it anonymously. A credential secret with an empty token would be
+      # worse than none.
       - name: Apply the ArgoCD root application
         run: |
           set -euo pipefail
@@ -349,6 +325,8 @@ stages:
       - name: Show platform components
         run: |
           set -euo pipefail
+          echo "--- kube-system (load balancer controller) ---"
+          kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller --no-headers || true
           echo "--- argocd ---"
           kubectl -n argocd get pods --no-headers || true
           echo "--- argo-rollouts ---"
@@ -411,10 +389,8 @@ stages:
 
 pipelines:
   # ---------------------------------------------------------------------
-  # Continuous application delivery.
-  #
-  # Runs on APPLICATION changes only, once the infrastructure exists. It
-  # never touches the cluster: it builds, scans, pushes to ECR and bumps the
+  # Continuous application delivery. Runs on APPLICATION changes only.
+  # Never touches the cluster: builds, scans, pushes to ECR and bumps the
   # image tag in gitops/. ArgoCD does the deploying.
   # ---------------------------------------------------------------------
   - id: app-delivery
@@ -475,9 +451,6 @@ pipelines:
           - name: Build image
             working-directory: app
             run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
-          # Same contract as the deploy pipeline: @master, NO `version:` input,
-          # and trivyignores pointed at app/.trivyignore because this step runs
-          # from the repository root.
           - name: Scan image with Trivy
             uses: aquasecurity/trivy-action@master
             with:
@@ -487,9 +460,6 @@ pipelines:
               severity: HIGH,CRITICAL
               ignore-unfixed: "true"
               trivyignores: app/.trivyignore
-          # Static credentials, same reason as the deploy pipeline: OIDC needs
-          # `permissions: id-token: write`, which the pipeline spec cannot
-          # express. See the note in build_push for the restore procedure.
           - name: Confirm the AWS identity in use
             run: |
               set -euo pipefail
