@@ -73,6 +73,15 @@ jobs:
       with:
         role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
         aws-region: us-east-1
+        unset-current-credentials: 'true'
+    - name: Confirm the OIDC identity in use
+      run: 'set -euo pipefail
+
+        echo "Authenticated as:"
+
+        aws sts get-caller-identity
+
+        '
     - id: ecr
       name: Log in to ECR
       uses: aws-actions/amazon-ecr-login@v2

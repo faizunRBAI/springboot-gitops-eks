@@ -112,6 +112,8 @@ stages:
       # Read the ECR URL from state rather than reconstructing it from a name
       # pattern. This job is self-sufficient: it does not consume job outputs
       # from provision, which GitHub would drop because they embed PROJECT_NAME.
+      # This step is why the job carries static AWS credentials in env — see
+      # the OIDC note further down, which explains why that matters.
       - name: Read the ECR repository URL from terraform state
         id: tf
         working-directory: infra
@@ -180,11 +182,29 @@ stages:
             exit 1
           fi
           echo "AWS_CI_ROLE_ARN is configured."
+      # unset-current-credentials IS LOAD BEARING. This job carries static AWS
+      # keys in env so the terraform step above can read remote state. Without
+      # this input, configure-aws-credentials PREFERS those static keys, never
+      # touches the OIDC token, and calls plain sts:AssumeRole as the IAM user
+      # — which fails with:
+      #   Assuming role with user credentials
+      #   Could not assume role with user credentials: User: ... is not
+      #   authorized to perform: sts:TagSession
+      # That error names the IAM user and looks like a missing account
+      # permission, but the real cause is that OIDC was silently bypassed.
+      # Clearing the ambient credentials makes the action use the web identity
+      # token, which is the whole point of the OIDC role.
       - name: Authenticate to AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
           aws-region: us-east-1
+          unset-current-credentials: "true"
+      - name: Confirm the OIDC identity in use
+        run: |
+          set -euo pipefail
+          echo "Authenticated as:"
+          aws sts get-caller-identity
       - name: Log in to ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -494,11 +514,21 @@ pipelines:
               severity: HIGH,CRITICAL
               ignore-unfixed: "true"
               trivyignores: app/.trivyignore
+          # unset-current-credentials is required here for the same reason as
+          # in the deploy pipeline: this job carries static AWS keys for the
+          # terraform step, and without clearing them the action silently
+          # ignores OIDC and calls sts:AssumeRole as the IAM user.
           - name: Authenticate to AWS via OIDC
             uses: aws-actions/configure-aws-credentials@v4
             with:
               role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
               aws-region: us-east-1
+              unset-current-credentials: "true"
+          - name: Confirm the OIDC identity in use
+            run: |
+              set -euo pipefail
+              echo "Authenticated as:"
+              aws sts get-caller-identity
           - name: Log in to ECR
             id: ecr
             uses: aws-actions/amazon-ecr-login@v2
