@@ -244,22 +244,33 @@ jobs:
       env:
         ADMIN_SECRET: ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
     - name: Publish the ArgoCD console ingress
-      run: 'set -euo pipefail
-
-        kubectl apply -f gitops/argocd-ingress.yaml
-
-        '
-    - name: Assert the ArgoCD ingress is not host-scoped
-      run: "set -euo pipefail\nHOST_RULE=$(kubectl -n argocd get ingress argocd-server\
-        \ \\\n  -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || echo \"\")\nif\
-        \ [ -n \"${HOST_RULE}\" ]; then\n  echo \"ERROR: the ArgoCD ingress rule is\
-        \ bound to host '${HOST_RULE}'.\"\n  echo \"Requests to the raw ALB DNS name\
-        \ will return 404.\"\n  echo \"The ingress must come from gitops/argocd-ingress.yaml,\
-        \ which\"\n  echo \"omits the host key. Check that server.ingress.enabled\
-        \ is false\"\n  echo \"in gitops/values/argocd-values.yaml \u2014 the chart\
-        \ re-creates a\"\n  echo \"host-scoped ingress of the same name when it is\
-        \ enabled.\"\n  exit 1\nfi\necho \"ArgoCD ingress matches any host, as intended.\"\
-        \n"
+      run: "set -euo pipefail\n# Let any in-flight deletion of the chart-owned object\
+        \ finish, so the\n# apply creates a NEW object instead of patching a doomed\
+        \ one.\nfor i in $(seq 1 30); do\n  TS=$(kubectl -n argocd get ingress argocd-server\
+        \ \\\n    -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || echo\
+        \ \"\")\n  if [ -z \"${TS}\" ]; then\n    break\n  fi\n  echo \"attempt ${i}:\
+        \ argocd-server ingress is terminating (${TS}); waiting\"\n  sleep 5\ndone\n\
+        kubectl apply -f gitops/argocd-ingress.yaml\n"
+      timeout-minutes: 6
+    - name: Assert the ArgoCD ingress exists and is not host-scoped
+      run: "set -euo pipefail\nfor i in $(seq 1 12); do\n  if kubectl -n argocd get\
+        \ ingress argocd-server >/dev/null 2>&1; then\n    TS=$(kubectl -n argocd\
+        \ get ingress argocd-server \\\n      -o jsonpath='{.metadata.deletionTimestamp}'\
+        \ 2>/dev/null || echo \"\")\n    if [ -z \"${TS}\" ]; then\n      HOST_RULE=$(kubectl\
+        \ -n argocd get ingress argocd-server \\\n        -o jsonpath='{.spec.rules[0].host}'\
+        \ 2>/dev/null || echo \"\")\n      if [ -n \"${HOST_RULE}\" ]; then\n    \
+        \    echo \"ERROR: the ArgoCD ingress rule is bound to host '${HOST_RULE}'.\"\
+        \n        echo \"Requests to the raw ALB DNS name will return 404.\"\n   \
+        \     echo \"The ingress must come from gitops/argocd-ingress.yaml,\"\n  \
+        \      echo \"which omits the host key. Check that server.ingress.enabled\"\
+        \n        echo \"is false in gitops/values/argocd-values.yaml.\"\n       \
+        \ exit 1\n      fi\n      echo \"ArgoCD ingress exists and matches any host,\
+        \ as intended.\"\n      exit 0\n    fi\n    echo \"attempt ${i}: ingress still\
+        \ terminating; re-applying\"\n  else\n    echo \"attempt ${i}: ingress absent;\
+        \ re-applying\"\n  fi\n  kubectl apply -f gitops/argocd-ingress.yaml || true\n\
+        \  sleep 10\ndone\necho \"ERROR: the ArgoCD ingress could not be established.\"\
+        \nkubectl -n argocd get ingress || true\nexit 1\n"
+      timeout-minutes: 4
     - name: Remove the superseded bootstrap admin secret
       run: 'kubectl -n argocd delete secret argocd-initial-admin-secret --ignore-not-found=true
         || true
@@ -430,6 +441,7 @@ jobs:
         ArgoCD console serving at http://${ARGOCD_HOST}\"\n      exit 0\n    fi\n\
         \  else\n    echo \"attempt ${i}: ArgoCD ingress address not assigned yet\"\
         \n  fi\n  sleep 20\ndone\necho \"The public ArgoCD console never served a\
-        \ 200. Diagnostics follow:\"\nkubectl -n argocd describe ingress argocd-server\
-        \ || true\nkubectl -n argocd get pods -o wide || true\nexit 1\n"
+        \ 200. Diagnostics follow:\"\nkubectl -n argocd get ingress || true\nkubectl\
+        \ -n argocd describe ingress argocd-server || true\nkubectl -n argocd get\
+        \ pods -o wide || true\nexit 1\n"
       timeout-minutes: 12

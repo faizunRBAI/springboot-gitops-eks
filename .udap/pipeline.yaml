@@ -281,31 +281,69 @@ stages:
       # argo-cd's server.ingress defaults hostname to "argocd.example.com" and
       # ignores an empty string, so its rendered rule is always host-scoped and
       # the raw ALB DNS name returns 404 while helm still reports success. The
-      # chart's ingress is therefore disabled in the values file and this
-      # manifest — which omits `host` entirely, matching any hostname — is
-      # applied instead. It must run AFTER the helm upgrade, because the
-      # upgrade removes the chart-owned ingress of the same name.
+      # chart's ingress is disabled in the values file and this manifest — which
+      # omits `host` entirely, matching any hostname — is applied instead.
+      #
+      # WAIT FOR THE IN-FLIGHT DELETION FIRST. On the transition run, the helm
+      # upgrade that disables the chart's ingress DELETES the object of the same
+      # name. Applying into that window produced:
+      #   Warning: Detected changes to resource argocd-server which is
+      #            currently being deleted.
+      #   ingress.networking.k8s.io/argocd-server configured
+      # ...and then the deletion completed and the ingress was GONE. The apply
+      # appeared to succeed and even satisfied the assertion below, because the
+      # object still existed for the moment it was read.
       - name: Publish the ArgoCD console ingress
+        timeout-minutes: 6
         run: |
           set -euo pipefail
+          # Let any in-flight deletion of the chart-owned object finish, so the
+          # apply creates a NEW object instead of patching a doomed one.
+          for i in $(seq 1 30); do
+            TS=$(kubectl -n argocd get ingress argocd-server \
+              -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || echo "")
+            if [ -z "${TS}" ]; then
+              break
+            fi
+            echo "attempt ${i}: argocd-server ingress is terminating (${TS}); waiting"
+            sleep 5
+          done
           kubectl apply -f gitops/argocd-ingress.yaml
-      # Assert the rendered result. helm's output cannot reveal a host-scoped
-      # rule, and a 404 through the ALB otherwise ships as a green deploy.
-      - name: Assert the ArgoCD ingress is not host-scoped
+      # Assert the object SURVIVED and is not host-scoped. Checking existence
+      # matters as much as the host: the apply-into-deletion race above left no
+      # ingress at all, which only surfaced two stages later in verify.
+      - name: Assert the ArgoCD ingress exists and is not host-scoped
+        timeout-minutes: 4
         run: |
           set -euo pipefail
-          HOST_RULE=$(kubectl -n argocd get ingress argocd-server \
-            -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || echo "")
-          if [ -n "${HOST_RULE}" ]; then
-            echo "ERROR: the ArgoCD ingress rule is bound to host '${HOST_RULE}'."
-            echo "Requests to the raw ALB DNS name will return 404."
-            echo "The ingress must come from gitops/argocd-ingress.yaml, which"
-            echo "omits the host key. Check that server.ingress.enabled is false"
-            echo "in gitops/values/argocd-values.yaml — the chart re-creates a"
-            echo "host-scoped ingress of the same name when it is enabled."
-            exit 1
-          fi
-          echo "ArgoCD ingress matches any host, as intended."
+          for i in $(seq 1 12); do
+            if kubectl -n argocd get ingress argocd-server >/dev/null 2>&1; then
+              TS=$(kubectl -n argocd get ingress argocd-server \
+                -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || echo "")
+              if [ -z "${TS}" ]; then
+                HOST_RULE=$(kubectl -n argocd get ingress argocd-server \
+                  -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || echo "")
+                if [ -n "${HOST_RULE}" ]; then
+                  echo "ERROR: the ArgoCD ingress rule is bound to host '${HOST_RULE}'."
+                  echo "Requests to the raw ALB DNS name will return 404."
+                  echo "The ingress must come from gitops/argocd-ingress.yaml,"
+                  echo "which omits the host key. Check that server.ingress.enabled"
+                  echo "is false in gitops/values/argocd-values.yaml."
+                  exit 1
+                fi
+                echo "ArgoCD ingress exists and matches any host, as intended."
+                exit 0
+              fi
+              echo "attempt ${i}: ingress still terminating; re-applying"
+            else
+              echo "attempt ${i}: ingress absent; re-applying"
+            fi
+            kubectl apply -f gitops/argocd-ingress.yaml || true
+            sleep 10
+          done
+          echo "ERROR: the ArgoCD ingress could not be established."
+          kubectl -n argocd get ingress || true
+          exit 1
       # The bootstrap credential is superseded by the rotated one above. Leaving
       # it in the cluster means a second valid-looking secret that no longer
       # matches the live login, which misleads whoever reads it next.
@@ -577,6 +615,7 @@ stages:
             sleep 20
           done
           echo "The public ArgoCD console never served a 200. Diagnostics follow:"
+          kubectl -n argocd get ingress || true
           kubectl -n argocd describe ingress argocd-server || true
           kubectl -n argocd get pods -o wide || true
           exit 1
