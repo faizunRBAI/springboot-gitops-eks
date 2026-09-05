@@ -28,8 +28,23 @@ resource "aws_iam_openid_connect_provider" "github" {
 
 data "aws_iam_policy_document" "github_ci_assume" {
   statement {
-    effect  = "Allow"
-    actions = ["sts:AssumeRoleWithWebIdentity"]
+    effect = "Allow"
+
+    # BOTH actions are required.
+    #
+    # sts:AssumeRoleWithWebIdentity is the exchange itself.
+    #
+    # sts:TagSession is required because aws-actions/configure-aws-credentials
+    # attaches SESSION TAGS (GitHub repository, workflow, actor, ref) to the
+    # assumed session for auditability. If the trust policy omits it, STS
+    # rejects the call and the job fails with an AccessDenied naming
+    # sts:TagSession — which reads like a missing permission on the CALLER,
+    # but is actually a missing permission on THIS trust policy. Granting
+    # sts:TagSession to the IAM user does nothing; the role must allow it.
+    actions = [
+      "sts:AssumeRoleWithWebIdentity",
+      "sts:TagSession",
+    ]
 
     principals {
       type        = "Federated"
