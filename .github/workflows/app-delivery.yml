@@ -68,13 +68,7 @@ jobs:
         severity: HIGH,CRITICAL
         ignore-unfixed: 'true'
         trivyignores: app/.trivyignore
-    - name: Authenticate to AWS via OIDC
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
-        aws-region: us-east-1
-        unset-current-credentials: 'true'
-    - name: Confirm the OIDC identity in use
+    - name: Confirm the AWS identity in use
       run: 'set -euo pipefail
 
         echo "Authenticated as:"

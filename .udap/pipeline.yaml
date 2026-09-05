@@ -38,9 +38,8 @@ stages:
           find app/target/surefire-reports -name '*.txt' -exec cat {} + >> "$GITHUB_STEP_SUMMARY" || true
 
   # PROVISION RUNS BEFORE BUILD_PUSH.
-  # Terraform creates the ECR repository AND the GitHub OIDC role that
-  # build_push authenticates with. Building first would mean pushing to a
-  # registry that does not exist yet, using a role that has not been created.
+  # Terraform creates the ECR repository that build_push pushes to. Building
+  # first would mean pushing to a registry that does not exist yet.
   - id: provision
     kind: provision
     needs: [test]
@@ -70,22 +69,6 @@ stages:
       - name: Terraform apply
         working-directory: infra
         run: terraform apply -input=false -auto-approve
-      - name: Report the CI role ARN for the AWS_CI_ROLE_ARN secret
-        working-directory: infra
-        run: |
-          set -euo pipefail
-          {
-            echo "### Infrastructure ready"
-            echo ""
-            echo "If this is the first deploy, set the AWS_CI_ROLE_ARN"
-            echo "repository secret to the value below and run deploy again."
-            echo ""
-            echo '```'
-            terraform output -raw ci_role_arn
-            echo ""
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "ci_role_arn recorded in the job summary."
 
   - id: build_push
     kind: build_push
@@ -112,8 +95,6 @@ stages:
       # Read the ECR URL from state rather than reconstructing it from a name
       # pattern. This job is self-sufficient: it does not consume job outputs
       # from provision, which GitHub would drop because they embed PROJECT_NAME.
-      # This step is why the job carries static AWS credentials in env — see
-      # the OIDC note further down, which explains why that matters.
       - name: Read the ECR repository URL from terraform state
         id: tf
         working-directory: infra
@@ -133,7 +114,7 @@ stages:
       - name: Build image
         working-directory: app
         run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
-      # Show what the accepted exceptions are, in the run log, every run.
+      # Show the accepted exceptions in the log on every run.
       # A suppression nobody sees is a suppression nobody reviews.
       - name: Show accepted vulnerability exceptions
         run: |
@@ -154,11 +135,10 @@ stages:
       # is untouched and every other HIGH/CRITICAL still fails the build.
       #
       # DO NOT ADD a `version:` input here. Pinning the scanner version makes
-      # the action take an install path that writes the binary to
-      # $HOME/.local/bin/trivy-bin WITHOUT creating that directory, and the
-      # installer exits 1 immediately after reporting "found version". The
-      # default path works. Likewise do not pin the action to a numeric tag:
-      # a nonexistent tag fails GitHub's pre-flight resolution and the job
+      # the action write the binary to $HOME/.local/bin/trivy-bin WITHOUT
+      # creating that directory, and the installer exits 1 immediately after
+      # reporting "found version". Likewise do not pin the action to a numeric
+      # tag: a nonexistent tag fails GitHub's pre-flight resolution and the job
       # never starts.
       - name: Scan image with Trivy
         uses: aquasecurity/trivy-action@master
@@ -169,38 +149,31 @@ stages:
           severity: HIGH,CRITICAL
           ignore-unfixed: "true"
           trivyignores: app/.trivyignore
-      - name: Verify the OIDC role secret is present
-        env:
-          CI_ROLE_ARN: ${{ secrets.AWS_CI_ROLE_ARN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${CI_ROLE_ARN}" ]; then
-            echo "AWS_CI_ROLE_ARN is not set."
-            echo ""
-            echo "It is created by the provision stage (terraform output"
-            echo "ci_role_arn). Set it as a repository secret and run again."
-            exit 1
-          fi
-          echo "AWS_CI_ROLE_ARN is configured."
-      # unset-current-credentials IS LOAD BEARING. This job carries static AWS
-      # keys in env so the terraform step above can read remote state. Without
-      # this input, configure-aws-credentials PREFERS those static keys, never
-      # touches the OIDC token, and calls plain sts:AssumeRole as the IAM user
-      # — which fails with:
-      #   Assuming role with user credentials
-      #   Could not assume role with user credentials: User: ... is not
-      #   authorized to perform: sts:TagSession
-      # That error names the IAM user and looks like a missing account
-      # permission, but the real cause is that OIDC was silently bypassed.
-      # Clearing the ambient credentials makes the action use the web identity
-      # token, which is the whole point of the OIDC role.
-      - name: Authenticate to AWS via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
-          aws-region: us-east-1
-          unset-current-credentials: "true"
-      - name: Confirm the OIDC identity in use
+      # ---------------------------------------------------------------------
+      # AUTHENTICATION: platform-injected static credentials.
+      #
+      # GitHub OIDC was the design intent and the terraform for it still
+      # exists (infra/oidc.tf: provider + repo-scoped role). It cannot be used
+      # from this pipeline because OIDC requires `permissions: id-token: write`
+      # on the job, and the platform's pipeline spec has no `permissions` key —
+      # verified: write_pipeline REFUSES it with
+      #   unknown key 'permissions' — allowed: [approval, env, id, kind,
+      #   needs, outputs, steps, timeout_minutes]
+      # Workflow files are rendered from the spec, so this cannot be patched by
+      # hand either.
+      #
+      # These static keys were ALREADY in this job's env for terraform state
+      # access, so using them for ECR adds no new credential exposure. When the
+      # platform gains a permissions field, restore the OIDC step:
+      #   - uses: aws-actions/configure-aws-credentials@v4
+      #     with:
+      #       role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+      #       aws-region: us-east-1
+      #       unset-current-credentials: "true"
+      # and delete this note. The IAM role is already provisioned and scoped to
+      # repo:<owner>/<repo>:ref:refs/heads/main.
+      # ---------------------------------------------------------------------
+      - name: Confirm the AWS identity in use
         run: |
           set -euo pipefail
           echo "Authenticated as:"
@@ -514,17 +487,10 @@ pipelines:
               severity: HIGH,CRITICAL
               ignore-unfixed: "true"
               trivyignores: app/.trivyignore
-          # unset-current-credentials is required here for the same reason as
-          # in the deploy pipeline: this job carries static AWS keys for the
-          # terraform step, and without clearing them the action silently
-          # ignores OIDC and calls sts:AssumeRole as the IAM user.
-          - name: Authenticate to AWS via OIDC
-            uses: aws-actions/configure-aws-credentials@v4
-            with:
-              role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
-              aws-region: us-east-1
-              unset-current-credentials: "true"
-          - name: Confirm the OIDC identity in use
+          # Static credentials, same reason as the deploy pipeline: OIDC needs
+          # `permissions: id-token: write`, which the pipeline spec cannot
+          # express. See the note in build_push for the restore procedure.
+          - name: Confirm the AWS identity in use
             run: |
               set -euo pipefail
               echo "Authenticated as:"

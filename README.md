@@ -15,7 +15,7 @@ GitHub monorepo ─────────────────────�
    │                                                      │
    │ (app/** changes)                                     │ (gitops/** changes)
    ▼                                                      │
-GitHub Actions  ── OIDC ──▶ AWS IAM role                  │
+GitHub Actions ───────────▶ AWS                           │
    │  test · build · Trivy image scan                     │
    │                                                      │
    ├──▶ push image ──▶ ECR (scan on push)                 │
@@ -99,7 +99,8 @@ infra/                   Terraform (AWS)
   network.tf             VPC, 3 AZs, single NAT gateway
   eks.tf                 EKS 1.33 control plane, node group, addons, IRSA
   ecr.tf                 ECR repository + lifecycle policy
-  oidc.tf                GitHub OIDC provider + scoped CI role
+  oidc.tf                GitHub OIDC provider + scoped role (provisioned,
+                         not currently used — see Security posture)
   lbc.tf                 AWS Load Balancer Controller IAM role
 .udap/                   Platform contracts
   architecture.d2        Architecture source of truth
@@ -187,20 +188,60 @@ front, not a default.
 
 ## Security posture
 
-- **No long-lived AWS keys in the delivery path.** GitHub Actions authenticates
-  via OIDC to an IAM role whose trust policy pins
-  `repo:<owner>/<repo>:ref:refs/heads/main`. A wildcard there would let any
-  repository on GitHub push to your registry.
 - **Image scanning at two points.** **Trivy** scans the built image and fails
   the build on HIGH/CRITICAL *before* the push, so a vulnerable image never
   enters ECR. Trivy inspects OS packages **and** application dependencies —
   including the Spring Boot JARs — so Java CVEs are covered. **ECR scan-on-push**
   re-scans stored images to catch CVEs disclosed after the build.
-- **Least-privilege IAM.** The CI role can push to exactly one ECR repository.
-  The Load Balancer Controller uses IRSA bound to one service account.
+- **Least-privilege IAM for in-cluster workloads.** The Load Balancer
+  Controller uses IRSA bound to one service account, not node-level
+  credentials.
 - **Hardened pods.** Non-root (uid 10001), read-only root filesystem, all
   capabilities dropped, `RuntimeDefault` seccomp.
 - **Private nodes.** Workers have no public IPs; egress goes through the NAT.
+- **No secrets in Git.** All credentials are repository secrets referenced as
+  `${{ secrets.NAME }}`; none are committed.
+
+### CI authentication: static keys, not OIDC — and why
+
+**The pipeline authenticates to AWS with the platform's injected static
+credentials.** GitHub OIDC was the intended design and the IAM infrastructure
+for it is fully provisioned in [`infra/oidc.tf`](infra/oidc.tf) — an OIDC
+provider plus a role whose trust policy is pinned to
+`repo:<owner>/<repo>:ref:refs/heads/main` with a least-privilege ECR policy.
+
+It is **not currently used**, for a platform reason rather than a design one:
+OIDC requires `permissions: id-token: write` on the workflow job, and the
+platform's pipeline spec has no `permissions` key. `write_pipeline` refuses it:
+
+```
+unknown key 'permissions' — allowed: [approval, env, id, kind, needs,
+outputs, steps, timeout_minutes]
+```
+
+Workflow files are rendered from that spec, so the permission cannot be added
+by hand either. Without it GitHub never mints an OIDC token:
+
+```
+It looks like you might be trying to authenticate with OIDC.
+Did you mean to set the `id-token` permission?
+Credentials could not be loaded: Could not load credentials from any providers
+```
+
+**What this does and does not cost.** The static credentials were already
+present in the job's environment because the Terraform steps read remote state
+with them, so using them for the ECR push adds no credential that was not
+already there. What is lost is the *short-lived, repo-scoped* property of OIDC:
+the delivery job now holds long-lived account credentials rather than a
+15-minute token scoped to one ECR repository.
+
+**To restore OIDC** once the platform supports job permissions: add
+`permissions: { id-token: write, contents: read }` to the `build_push` and
+`app_release` stages, then reinstate the auth step documented at the top of
+`infra/oidc.tf`. Note that `unset-current-credentials: true` is required on
+that step — static keys in the job environment otherwise take precedence and
+OIDC is silently skipped, producing a confusing `sts:TagSession` error that
+names the IAM user rather than the real cause. No Terraform changes are needed.
 
 ### Accepted vulnerability exceptions — REVIEW BY 2026-10-05
 
@@ -243,6 +284,7 @@ prints them in the job summary on every run.
 
 ### Known gaps (deliberate, not oversights)
 
+- **CI uses long-lived AWS credentials** — see the section above.
 - **No source-level dependency scanner.** OWASP dependency-check was removed:
   without an NVD API key it ran 10–40 minutes and exceeded the stage timeout.
   Trivy's image scan covers the same Java CVEs at the deployed artifact. To
@@ -283,29 +325,23 @@ and all configuration survive, so redeploying later is a single action.
 
 ## Deployment order
 
-1. **Provision** — Terraform builds the VPC, EKS, ECR, and the OIDC role.
-2. Set `AWS_CI_ROLE_ARN` from `terraform output -raw ci_role_arn`.
-3. **Build and push** — image built, Trivy-scanned, pushed to ECR.
-4. **Configure** — installs the Load Balancer Controller, Argo Rollouts,
+1. **Provision** — Terraform builds the VPC, EKS, ECR and IAM.
+2. **Build and push** — image built, Trivy-scanned, pushed to ECR.
+3. **Configure** — installs the Load Balancer Controller, Argo Rollouts,
    kube-prometheus-stack and ArgoCD, then applies the root Application.
-5. **Verify** — waits for ArgoCD to report Synced/Healthy, then probes the ALB.
+4. **Verify** — waits for ArgoCD to report Synced/Healthy, then probes the ALB.
 
 Afterwards, every `app/**` commit runs the `app-delivery` workflow only.
-
-> **First deploy is a two-pass bootstrap.** `AWS_CI_ROLE_ARN` is an *output* of
-> the Terraform that runs in the same pipeline, so it cannot exist before the
-> first provision. Run 1 builds the infrastructure; set the secret from
-> `terraform output -raw ci_role_arn`; run 2 completes the delivery path.
 
 ## Required repository secrets
 
 | Secret | Purpose | Who sets it |
 |---|---|---|
-| `AWS_CI_ROLE_ARN` | OIDC role for ECR pushes | After first provision, from `terraform output ci_role_arn` |
 | `GRAFANA_ADMIN_PASSWORD` | Grafana admin login | Generated at setup |
+| `AWS_CI_ROLE_ARN` | OIDC role ARN — set, but unused until the platform supports `id-token` | From `terraform output ci_role_arn` |
 
-`PROJECT_NAME`, `TF_STATE_BUCKET` and the AWS provisioning credentials are
-injected by the platform.
+`PROJECT_NAME`, `TF_STATE_BUCKET` and the AWS credentials are injected by the
+platform.
 
 ---
 

@@ -70,14 +70,6 @@ jobs:
     - name: Terraform apply
       run: terraform apply -input=false -auto-approve
       working-directory: infra
-    - name: Report the CI role ARN for the AWS_CI_ROLE_ARN secret
-      run: "set -euo pipefail\n{\n  echo \"### Infrastructure ready\"\n  echo \"\"\
-        \n  echo \"If this is the first deploy, set the AWS_CI_ROLE_ARN\"\n  echo\
-        \ \"repository secret to the value below and run deploy again.\"\n  echo \"\
-        \"\n  echo '```'\n  terraform output -raw ci_role_arn\n  echo \"\"\n  echo\
-        \ '```'\n} >> \"$GITHUB_STEP_SUMMARY\"\necho \"ci_role_arn recorded in the\
-        \ job summary.\"\n"
-      working-directory: infra
   build_push:
     runs-on: ubuntu-latest
     needs:
@@ -145,20 +137,7 @@ jobs:
         severity: HIGH,CRITICAL
         ignore-unfixed: 'true'
         trivyignores: app/.trivyignore
-    - name: Verify the OIDC role secret is present
-      run: "set -euo pipefail\nif [ -z \"${CI_ROLE_ARN}\" ]; then\n  echo \"AWS_CI_ROLE_ARN\
-        \ is not set.\"\n  echo \"\"\n  echo \"It is created by the provision stage\
-        \ (terraform output\"\n  echo \"ci_role_arn). Set it as a repository secret\
-        \ and run again.\"\n  exit 1\nfi\necho \"AWS_CI_ROLE_ARN is configured.\"\n"
-      env:
-        CI_ROLE_ARN: ${{ secrets.AWS_CI_ROLE_ARN }}
-    - name: Authenticate to AWS via OIDC
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
-        aws-region: us-east-1
-        unset-current-credentials: 'true'
-    - name: Confirm the OIDC identity in use
+    - name: Confirm the AWS identity in use
       run: 'set -euo pipefail
 
         echo "Authenticated as:"

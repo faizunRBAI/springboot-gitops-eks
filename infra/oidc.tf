@@ -1,14 +1,42 @@
 # ---------------------------------------------------------------------------
-# GitHub Actions -> AWS via OIDC (no long-lived access keys).
+# GitHub Actions -> AWS via OIDC.
 #
-# GitHub Actions requests a short-lived OIDC token; AWS STS exchanges it for
-# temporary credentials, but ONLY if the token's claims match the trust policy
-# below. Nothing secret is stored in the repository.
+# STATUS: PROVISIONED BUT NOT CURRENTLY USED.
 #
-# Scope note: the platform's own provision/destroy stages authenticate with
-# platform-injected keys (the terraform state backend is platform-managed and
-# that cannot be changed). This role covers the per-commit delivery path —
-# build, scan, push to ECR — which is the path that runs on every change.
+# This was the intended authentication path for the delivery pipeline, and it
+# is kept intact so it can be switched on without redesign. It is not in use
+# because OIDC requires `permissions: id-token: write` on the workflow job, and
+# the platform's pipeline spec (.udap/pipeline.yaml) has no `permissions` key —
+# write_pipeline refuses it:
+#
+#   unknown key 'permissions' — allowed: [approval, env, id, kind, needs,
+#   outputs, steps, timeout_minutes]
+#
+# Workflow files are RENDERED from that spec, so the permission cannot be added
+# by editing .github/workflows/ either. Without the permission GitHub never
+# mints an OIDC token and the action fails with:
+#
+#   It looks like you might be trying to authenticate with OIDC.
+#   Did you mean to set the `id-token` permission?
+#   Credentials could not be loaded ... Could not load credentials from any
+#   providers
+#
+# The delivery pipeline therefore authenticates to ECR with the platform's
+# injected static credentials, which were already present in the job for
+# terraform state access.
+#
+# TO RE-ENABLE once the platform supports job permissions: add
+#   permissions: { id-token: write, contents: read }
+# to the build_push / app_release stages, then restore the auth step:
+#   - uses: aws-actions/configure-aws-credentials@v4
+#     with:
+#       role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+#       aws-region: us-east-1
+#       unset-current-credentials: "true"   # REQUIRED: static keys in the job
+#                                           # env otherwise take precedence and
+#                                           # OIDC is silently skipped
+# Nothing in this file needs to change: the provider, the repo-scoped role and
+# the least-privilege ECR policy are already correct.
 # ---------------------------------------------------------------------------
 
 data "aws_caller_identity" "current" {}
@@ -72,7 +100,7 @@ data "aws_iam_policy_document" "github_ci_assume" {
 
 resource "aws_iam_role" "github_ci" {
   name               = "${var.project_name}-github-ci"
-  description        = "Assumed by GitHub Actions via OIDC to push images to ECR"
+  description        = "Assumed by GitHub Actions via OIDC to push images to ECR (provisioned; see file header for why it is not yet in use)"
   assume_role_policy = data.aws_iam_policy_document.github_ci_assume.json
 
   # Delivery jobs are short; cap the credential lifetime accordingly.
