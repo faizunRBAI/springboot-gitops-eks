@@ -138,8 +138,6 @@ jobs:
     - name: Confirm the AWS identity in use
       run: 'set -euo pipefail
 
-        echo "Authenticated as:"
-
         aws sts get-caller-identity
 
         '
@@ -223,18 +221,9 @@ jobs:
         helm repo update\nhelm upgrade --install monitoring prometheus-community/kube-prometheus-stack\
         \ \\\n  --version 66.3.1 --namespace monitoring --create-namespace \\\n  --values\
         \ gitops/values/monitoring-values.yaml \\\n  --set grafana.adminPassword=\"\
-        ${{ secrets.GRAFANA_ADMIN_PASSWORD }}\"\necho \"Waiting for the Prometheus\
-        \ StatefulSet to become ready...\"\nkubectl -n monitoring rollout status statefulset/prometheus-monitoring-kube-prometheus-prometheus\
-        \ --timeout=15m\n"
+        ${{ secrets.GRAFANA_ADMIN_PASSWORD }}\"\nkubectl -n monitoring rollout status\
+        \ statefulset/prometheus-monitoring-kube-prometheus-prometheus --timeout=15m\n"
       timeout-minutes: 20
-    - name: Show monitoring state
-      run: 'set -euo pipefail
-
-        kubectl -n monitoring get pods -o wide
-
-        kubectl -n monitoring get pvc
-
-        '
     - name: Install ArgoCD
       run: "set -euo pipefail\nhelm upgrade --install argocd argo/argo-cd \\\n  --version\
         \ 7.7.11 --namespace argocd --create-namespace \\\n  --values gitops/values/argocd-values.yaml\n\
@@ -242,12 +231,50 @@ jobs:
         kubectl -n argocd rollout status statefulset/argocd-application-controller\
         \ --timeout=10m\n"
       timeout-minutes: 15
-    - name: Point the GitOps values at the real ECR repository and image tag
+    - name: Report platform state
       run: 'set -euo pipefail
 
-        ECR_URL="$(terraform output -raw ecr_repository_url)"
+        helm list --all-namespaces
 
-        cd ..
+        kubectl get pods -A --no-headers | grep -v Running || echo "All pods Running."
+
+        '
+  gitops_handoff:
+    runs-on: ubuntu-latest
+    needs:
+    - configure
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_region: us-east-1
+      TF_VAR_github_repo: ${{ github.repository }}
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.9.8
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v4
+      with:
+        version: v1.33.0
+    - id: tf
+      name: Read infrastructure outputs from terraform state
+      run: "set -euo pipefail\nterraform init -input=false -reconfigure \\\n  -backend-config=\"\
+        bucket=${{ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"key=${{ secrets.PROJECT_NAME\
+        \ }}/terraform.tfstate\" \\\n  -backend-config=\"region=us-east-1\"\necho\
+        \ \"cluster_name=$(terraform output -raw cluster_name)\" >> \"$GITHUB_OUTPUT\"\
+        \necho \"ecr_url=$(terraform output -raw ecr_repository_url)\" >> \"$GITHUB_OUTPUT\"\
+        \n"
+      working-directory: infra
+    - name: Update kubeconfig
+      run: aws eks update-kubeconfig --name "${{ steps.tf.outputs.cluster_name }}"
+        --region us-east-1
+    - name: Point the GitOps values at the real ECR repository and image tag
+      run: 'set -euo pipefail
 
         TAG="${GITHUB_SHA::12}"
 
@@ -273,29 +300,45 @@ jobs:
 
         p.write_text(text)
 
-        print(f"gitops values -> {ecr}:{tag}")
+        print(f"gitops/application-values.yaml -> {ecr}:{tag}")
 
         PY
 
+        echo "--- resulting image block ---"
+
+        sed -n ''/^image:/,/^$/p'' gitops/application-values.yaml
+
         '
-      working-directory: infra
+      env:
+        ECR_URL: ${{ steps.tf.outputs.ecr_url }}
     - name: Commit the GitOps values if they changed
       run: "set -euo pipefail\ngit config user.name \"github-actions[bot]\"\ngit config\
         \ user.email \"github-actions[bot]@users.noreply.github.com\"\nif git diff\
         \ --quiet -- gitops/application-values.yaml; then\n  echo \"GitOps values\
         \ already current; nothing to commit.\"\nelse\n  git add gitops/application-values.yaml\n\
-        \  # [skip ci] is loop-prevention layer 1.\n  git commit -m \"chore(gitops):\
-        \ pin image tag ${GITHUB_SHA::12} [skip ci]\"\n  git push origin HEAD:main\n\
-        fi\n"
+        \  # [skip ci] is loop-prevention layer 1: this commit must never\n  # start\
+        \ another delivery run.\n  git commit -m \"chore(gitops): pin image tag ${GITHUB_SHA::12}\
+        \ [skip ci]\"\n  git push origin HEAD:main\n  echo \"Pushed. ArgoCD will reconcile\
+        \ this commit onto the cluster.\"\nfi\n"
     - name: Apply the ArgoCD root application
       run: "set -euo pipefail\nsed \"s|__REPO_URL__|https://github.com/${{ github.repository\
-        \ }}.git|g\" \\\n  gitops/root-app.yaml | kubectl apply -f -\necho \"Root\
-        \ application applied:\"\nkubectl -n argocd get applications\n"
+        \ }}.git|g\" \\\n  gitops/root-app.yaml | kubectl apply -f -\n"
+    - name: Confirm the application exists
+      run: 'set -euo pipefail
+
+        kubectl -n argocd get applications
+
+        echo "### GitOps handoff complete" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "ArgoCD now owns the application. CI does not deploy." >> "$GITHUB_STEP_SUMMARY"
+
+        '
   verify:
     runs-on: ubuntu-latest
     needs:
     - provision
     - configure
+    - gitops_handoff
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -330,7 +373,7 @@ jobs:
     - name: Show platform components
       run: 'set -euo pipefail
 
-        echo "--- kube-system (load balancer controller) ---"
+        echo "--- load balancer controller ---"
 
         kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller
         --no-headers || true

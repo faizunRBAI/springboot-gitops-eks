@@ -71,8 +71,6 @@ jobs:
     - name: Confirm the AWS identity in use
       run: 'set -euo pipefail
 
-        echo "Authenticated as:"
-
         aws sts get-caller-identity
 
         '
