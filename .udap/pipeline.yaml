@@ -276,6 +276,24 @@ stages:
             --set-string configs.secret.argocdServerAdminPassword="${HASH}"
           kubectl -n argocd rollout status deployment/argocd-server --timeout=10m
           kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=10m
+      # The ingress rule MUST NOT be bound to the chart's default placeholder
+      # host. argo-cd defaults server.ingress.hostname to argocd.example.com, so
+      # an unset hostname renders a host-scoped rule and every request to the
+      # raw ALB DNS name returns 404 while the install still reports success.
+      # gitops/values/argocd-values.yaml sets hostname: "" — this asserts the
+      # rendered result, because the failure is invisible from helm's output.
+      - name: Assert the ArgoCD ingress is not host-scoped
+        run: |
+          set -euo pipefail
+          HOST_RULE=$(kubectl -n argocd get ingress argocd-server \
+            -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || echo "")
+          if [ -n "${HOST_RULE}" ]; then
+            echo "ERROR: the ArgoCD ingress rule is bound to host '${HOST_RULE}'."
+            echo "Requests to the raw ALB DNS name will return 404."
+            echo "Set server.ingress.hostname: \"\" in gitops/values/argocd-values.yaml."
+            exit 1
+          fi
+          echo "ArgoCD ingress matches any host, as intended."
       # The bootstrap credential is superseded by the rotated one above. Leaving
       # it in the cluster means a second valid-looking secret that no longer
       # matches the live login, which misleads whoever reads it next.
@@ -507,42 +525,49 @@ stages:
           kubectl -n springboot-app describe ingress springboot-app || true
           kubectl -n springboot-app get pods -o wide || true
           exit 1
-      # Probe the public ArgoCD console and report its address, so the exposure
-      # is visible in the run summary rather than only in a values-file comment.
-      # Reporting only: a slow ALB registration must not fail an otherwise good
-      # deploy, so this never exits non-zero.
-      - name: Report the ArgoCD console address
-        timeout-minutes: 8
+      # PROBE THE PUBLIC CONSOLE FOR REAL, and FAIL if it does not serve.
+      #
+      # An earlier version of this step only reported the address and never
+      # failed. The console was returning 404 through the ALB (a host-scoped
+      # ingress rule) while the deploy went green, so the one thing the user
+      # asked for was broken and the pipeline said everything was fine.
+      #
+      # Probing / rather than /healthz: argocd-server serves the UI at / and
+      # has no /healthz on the HTTP route, so /healthz 404s even when healthy.
+      - name: Verify the public ArgoCD console serves
+        timeout-minutes: 12
         run: |
+          set -euo pipefail
           ARGOCD_HOST=""
-          for i in $(seq 1 20); do
-            ARGOCD_HOST=$(kubectl -n argocd get ingress argocd-server \
-              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-            if [ -n "${ARGOCD_HOST}" ]; then
-              break
+          for i in $(seq 1 40); do
+            if [ -z "${ARGOCD_HOST}" ]; then
+              ARGOCD_HOST=$(kubectl -n argocd get ingress argocd-server \
+                -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
             fi
-            echo "attempt ${i}: ArgoCD ingress address not assigned yet"
-            sleep 15
-          done
-          {
-            echo "### ArgoCD console — PUBLIC, HTTP, admin-credentialed"
-            echo ""
             if [ -n "${ARGOCD_HOST}" ]; then
-              echo "http://${ARGOCD_HOST}"
-              echo ""
-              if curl --fail --silent --show-error --max-time 10 \
-                   "http://${ARGOCD_HOST}/healthz" >/dev/null 2>&1; then
-                echo "Health check: serving."
-              else
-                echo "Health check: not answering yet (ALB target registration"
-                echo "takes a few minutes after the ingress is created)."
+              CODE=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+                --max-time 10 "http://${ARGOCD_HOST}/" || echo "000")
+              echo "attempt ${i}: host=${ARGOCD_HOST} status=${CODE}"
+              if [ "${CODE}" = "200" ]; then
+                {
+                  echo "### ArgoCD console — PUBLIC, HTTP, admin-credentialed"
+                  echo ""
+                  echo "http://${ARGOCD_HOST}"
+                  echo ""
+                  echo "Reachable from 0.0.0.0/0 with no TLS and no SSO. Demo only."
+                } >> "$GITHUB_STEP_SUMMARY"
+                echo "ArgoCD console serving at http://${ARGOCD_HOST}"
+                exit 0
               fi
             else
-              echo "Ingress address not assigned yet."
+              echo "attempt ${i}: ArgoCD ingress address not assigned yet"
             fi
-            echo ""
-            echo "Reachable from 0.0.0.0/0 with no TLS and no SSO. Demo only."
-          } >> "$GITHUB_STEP_SUMMARY"
+            sleep 20
+          done
+          echo "The public ArgoCD console never served a 200. Diagnostics follow:"
+          kubectl -n argocd describe ingress argocd-server || true
+          kubectl -n argocd get pods -o wide || true
+          exit 1
 
 pipelines:
   # ---------------------------------------------------------------------

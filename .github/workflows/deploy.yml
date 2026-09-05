@@ -243,6 +243,13 @@ jobs:
       timeout-minutes: 15
       env:
         ADMIN_SECRET: ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+    - name: Assert the ArgoCD ingress is not host-scoped
+      run: "set -euo pipefail\nHOST_RULE=$(kubectl -n argocd get ingress argocd-server\
+        \ \\\n  -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || echo \"\")\nif\
+        \ [ -n \"${HOST_RULE}\" ]; then\n  echo \"ERROR: the ArgoCD ingress rule is\
+        \ bound to host '${HOST_RULE}'.\"\n  echo \"Requests to the raw ALB DNS name\
+        \ will return 404.\"\n  echo \"Set server.ingress.hostname: \\\"\\\" in gitops/values/argocd-values.yaml.\"\
+        \n  exit 1\nfi\necho \"ArgoCD ingress matches any host, as intended.\"\n"
     - name: Remove the superseded bootstrap admin secret
       run: 'kubectl -n argocd delete secret argocd-initial-admin-secret --ignore-not-found=true
         || true
@@ -398,18 +405,21 @@ jobs:
         \ follow:\"\nkubectl -n springboot-app describe ingress springboot-app ||\
         \ true\nkubectl -n springboot-app get pods -o wide || true\nexit 1\n"
       timeout-minutes: 12
-    - name: Report the ArgoCD console address
-      run: "ARGOCD_HOST=\"\"\nfor i in $(seq 1 20); do\n  ARGOCD_HOST=$(kubectl -n\
-        \ argocd get ingress argocd-server \\\n    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'\
-        \ 2>/dev/null || echo \"\")\n  if [ -n \"${ARGOCD_HOST}\" ]; then\n    break\n\
-        \  fi\n  echo \"attempt ${i}: ArgoCD ingress address not assigned yet\"\n\
-        \  sleep 15\ndone\n{\n  echo \"### ArgoCD console \u2014 PUBLIC, HTTP, admin-credentialed\"\
-        \n  echo \"\"\n  if [ -n \"${ARGOCD_HOST}\" ]; then\n    echo \"http://${ARGOCD_HOST}\"\
-        \n    echo \"\"\n    if curl --fail --silent --show-error --max-time 10 \\\
-        \n         \"http://${ARGOCD_HOST}/healthz\" >/dev/null 2>&1; then\n     \
-        \ echo \"Health check: serving.\"\n    else\n      echo \"Health check: not\
-        \ answering yet (ALB target registration\"\n      echo \"takes a few minutes\
-        \ after the ingress is created).\"\n    fi\n  else\n    echo \"Ingress address\
-        \ not assigned yet.\"\n  fi\n  echo \"\"\n  echo \"Reachable from 0.0.0.0/0\
-        \ with no TLS and no SSO. Demo only.\"\n} >> \"$GITHUB_STEP_SUMMARY\"\n"
-      timeout-minutes: 8
+    - name: Verify the public ArgoCD console serves
+      run: "set -euo pipefail\nARGOCD_HOST=\"\"\nfor i in $(seq 1 40); do\n  if [\
+        \ -z \"${ARGOCD_HOST}\" ]; then\n    ARGOCD_HOST=$(kubectl -n argocd get ingress\
+        \ argocd-server \\\n      -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'\
+        \ 2>/dev/null || echo \"\")\n  fi\n  if [ -n \"${ARGOCD_HOST}\" ]; then\n\
+        \    CODE=$(curl --silent --output /dev/null --write-out '%{http_code}' \\\
+        \n      --max-time 10 \"http://${ARGOCD_HOST}/\" || echo \"000\")\n    echo\
+        \ \"attempt ${i}: host=${ARGOCD_HOST} status=${CODE}\"\n    if [ \"${CODE}\"\
+        \ = \"200\" ]; then\n      {\n        echo \"### ArgoCD console \u2014 PUBLIC,\
+        \ HTTP, admin-credentialed\"\n        echo \"\"\n        echo \"http://${ARGOCD_HOST}\"\
+        \n        echo \"\"\n        echo \"Reachable from 0.0.0.0/0 with no TLS and\
+        \ no SSO. Demo only.\"\n      } >> \"$GITHUB_STEP_SUMMARY\"\n      echo \"\
+        ArgoCD console serving at http://${ARGOCD_HOST}\"\n      exit 0\n    fi\n\
+        \  else\n    echo \"attempt ${i}: ArgoCD ingress address not assigned yet\"\
+        \n  fi\n  sleep 20\ndone\necho \"The public ArgoCD console never served a\
+        \ 200. Diagnostics follow:\"\nkubectl -n argocd describe ingress argocd-server\
+        \ || true\nkubectl -n argocd get pods -o wide || true\nexit 1\n"
+      timeout-minutes: 12

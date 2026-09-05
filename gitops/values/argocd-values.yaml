@@ -76,16 +76,34 @@ server:
   ingress:
     enabled: true
     ingressClassName: alb
+
+    # hostname MUST be explicitly empty.
+    #
+    # Unlike the grafana chart (which simply omits the host when none is set),
+    # argo-cd DEFAULTS server.ingress.hostname to "argocd.example.com". Leaving
+    # it unset renders a rule bound to that placeholder host, so the ALB only
+    # matches requests carrying that Host header and every request to the raw
+    # ALB DNS name falls through to the default action and returns 404.
+    #
+    # The install still succeeds and the pipeline still goes green — the
+    # failure is only visible from an actual HTTP request. Setting "" produces
+    # a hostless rule that matches any Host, which is what makes the raw ALB
+    # hostname usable without a domain.
+    #
+    # Put the real hostname here once DNS and TLS exist.
+    hostname: ""
+
     annotations:
       alb.ingress.kubernetes.io/scheme: internet-facing
       alb.ingress.kubernetes.io/target-type: ip
       alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
-      alb.ingress.kubernetes.io/healthcheck-path: /healthz
+      # argocd-server exposes no /healthz on the HTTP route; / returns the UI.
+      # A wrong path here marks every target unhealthy and the ALB serves 503.
+      alb.ingress.kubernetes.io/healthcheck-path: /
+      alb.ingress.kubernetes.io/success-codes: "200"
       # A dedicated ALB. Sharing the monitoring or application group would
       # couple an admin console's exposure to unrelated services.
       alb.ingress.kubernetes.io/group.name: argocd
-    # No host rule: match any hostname so the raw ALB DNS name works without a
-    # domain. Add the real host here once DNS and TLS exist.
     path: /
     pathType: Prefix
 
