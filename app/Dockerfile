@@ -26,7 +26,13 @@ RUN java -Djarmode=layertools -jar target/*.jar extract --destination /build/lay
 # ---------- Stage 2: runtime ----------
 FROM eclipse-temurin:21.0.5_11-jre-alpine AS runtime
 
-RUN apk add --no-cache curl \
+# `apk upgrade` patches OS packages that the base image shipped with known
+# CVEs (openssl and friends are the usual offenders). Without it, Trivy fails
+# the build on fixable HIGH/CRITICAL findings that have nothing to do with the
+# application code. Runs in the same layer as the package install so the
+# apk cache never reaches the final image.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache curl \
     && addgroup -S -g 10001 app \
     && adduser -S -u 10001 -G app app
 

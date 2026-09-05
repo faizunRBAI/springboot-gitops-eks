@@ -19,6 +19,27 @@
 
     <properties>
         <java.version>21</java.version>
+
+        <!--
+            SECURITY OVERRIDE - embedded Tomcat.
+
+            Trivy failed the build on HIGH/CRITICAL CVEs in the Tomcat that
+            spring-boot-starter-web pulls in transitively at Boot 3.4.1:
+
+              CVE-2025-48988  DoS in multipart upload      fixed in 10.1.42
+              CVE-2025-48989  HTTP/2 "MadeYouReset" DoS     fixed in 10.1.44
+              CVE-2026-68525  FORM authentication bypass
+
+            spring-boot-starter-parent exposes tomcat.version precisely so a
+            patched Tomcat can be adopted without waiting for the next Boot
+            release. 10.1.44 is the lowest version that covers all three.
+
+            Raise this when new advisories land. Do NOT instead relax the
+            Trivy severity threshold or set exit-code 0: that hides the
+            vulnerability rather than removing it, and the image would ship
+            with a known remote DoS.
+        -->
+        <tomcat.version>10.1.44</tomcat.version>
     </properties>
 
     <dependencies>
@@ -73,7 +94,8 @@
           * Trivy scans the BUILT IMAGE in the release stage and fails on
             HIGH/CRITICAL before the image is pushed to ECR. It inspects OS
             packages and application dependencies, including the JARs inside
-            the layered Spring Boot image.
+            the layered Spring Boot image. The tomcat.version override above
+            exists because Trivy caught exactly this class of issue.
           * ECR scan on push re-scans stored images, catching CVEs disclosed
             after the build.
 
