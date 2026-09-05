@@ -276,12 +276,21 @@ stages:
             --set-string configs.secret.argocdServerAdminPassword="${HASH}"
           kubectl -n argocd rollout status deployment/argocd-server --timeout=10m
           kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=10m
-      # The ingress rule MUST NOT be bound to the chart's default placeholder
-      # host. argo-cd defaults server.ingress.hostname to argocd.example.com, so
-      # an unset hostname renders a host-scoped rule and every request to the
-      # raw ALB DNS name returns 404 while the install still reports success.
-      # gitops/values/argocd-values.yaml sets hostname: "" — this asserts the
-      # rendered result, because the failure is invisible from helm's output.
+      # THE PUBLIC INGRESS IS OURS, NOT THE CHART'S.
+      #
+      # argo-cd's server.ingress defaults hostname to "argocd.example.com" and
+      # ignores an empty string, so its rendered rule is always host-scoped and
+      # the raw ALB DNS name returns 404 while helm still reports success. The
+      # chart's ingress is therefore disabled in the values file and this
+      # manifest — which omits `host` entirely, matching any hostname — is
+      # applied instead. It must run AFTER the helm upgrade, because the
+      # upgrade removes the chart-owned ingress of the same name.
+      - name: Publish the ArgoCD console ingress
+        run: |
+          set -euo pipefail
+          kubectl apply -f gitops/argocd-ingress.yaml
+      # Assert the rendered result. helm's output cannot reveal a host-scoped
+      # rule, and a 404 through the ALB otherwise ships as a green deploy.
       - name: Assert the ArgoCD ingress is not host-scoped
         run: |
           set -euo pipefail
@@ -290,7 +299,10 @@ stages:
           if [ -n "${HOST_RULE}" ]; then
             echo "ERROR: the ArgoCD ingress rule is bound to host '${HOST_RULE}'."
             echo "Requests to the raw ALB DNS name will return 404."
-            echo "Set server.ingress.hostname: \"\" in gitops/values/argocd-values.yaml."
+            echo "The ingress must come from gitops/argocd-ingress.yaml, which"
+            echo "omits the host key. Check that server.ingress.enabled is false"
+            echo "in gitops/values/argocd-values.yaml — the chart re-creates a"
+            echo "host-scoped ingress of the same name when it is enabled."
             exit 1
           fi
           echo "ArgoCD ingress matches any host, as intended."

@@ -46,66 +46,29 @@ configs:
 
 server:
   # ---------------------------------------------------------------------
-  # INTERNET-EXPOSED — DELIBERATE, EXPLICITLY REQUESTED, TEST/DEMO ONLY.
+  # THE CONSOLE IS INTERNET-EXPOSED, but NOT through this chart.
   #
-  # THIS IS NOT A DASHBOARD. ArgoCD is the cluster's CONTROL PLANE. The admin
-  # account can sync, delete, and mutate every resource ArgoCD manages, which
-  # here is the entire application. Whoever holds this password effectively
-  # holds the cluster.
+  # server.ingress stays DISABLED. The chart defaults its ingress hostname to
+  # the placeholder "argocd.example.com" and does not honour an empty string,
+  # so its rendered rule is always host-scoped and the raw ALB DNS name
+  # returns 404. Verified against the live release: setting hostname: ""
+  # changed nothing, while annotation changes in the same commit applied
+  # normally — so the values file was being read; the chart simply overrides
+  # an empty hostname with its default.
   #
-  # WHAT IS NOW TRUE:
-  #   * the login page is reachable from 0.0.0.0/0 and ALB hostnames are
-  #     continuously scanned; an exposed ArgoCD login is a known target
-  #   * there is NO TLS, so the admin password crosses the internet in
-  #     CLEARTEXT on every login and is readable by anyone on the path
-  #   * there is no SSO, no MFA, and no source-IP restriction; the password
-  #     is the only control
+  # The public ingress is therefore a manifest this repository owns:
+  #   gitops/argocd-ingress.yaml   (applied by the configure stage)
+  # It omits the host key entirely, which matches any hostname.
   #
-  # The user asked for full public access for a demo, having been shown these
-  # consequences. This environment holds no real data.
-  #
-  # BEFORE THIS IS EVER PRODUCTION (all three, not one):
-  #   1. TLS via cert-manager + ACM/Route53, redirect 80 -> 443
-  #   2. SSO (dex/OIDC) or alb.ingress.kubernetes.io/inbound-cidrs limiting
-  #      the ALB to known source addresses
-  #   3. rotate ARGOCD_ADMIN_PASSWORD, since it has travelled unencrypted
+  # DO NOT re-enable this and delete that file without checking the rendered
+  # rule: helm reports success either way and the failure is visible only from
+  # an actual HTTP request.
   # ---------------------------------------------------------------------
   service:
     type: ClusterIP
 
   ingress:
-    enabled: true
-    ingressClassName: alb
-
-    # hostname MUST be explicitly empty.
-    #
-    # Unlike the grafana chart (which simply omits the host when none is set),
-    # argo-cd DEFAULTS server.ingress.hostname to "argocd.example.com". Leaving
-    # it unset renders a rule bound to that placeholder host, so the ALB only
-    # matches requests carrying that Host header and every request to the raw
-    # ALB DNS name falls through to the default action and returns 404.
-    #
-    # The install still succeeds and the pipeline still goes green — the
-    # failure is only visible from an actual HTTP request. Setting "" produces
-    # a hostless rule that matches any Host, which is what makes the raw ALB
-    # hostname usable without a domain.
-    #
-    # Put the real hostname here once DNS and TLS exist.
-    hostname: ""
-
-    annotations:
-      alb.ingress.kubernetes.io/scheme: internet-facing
-      alb.ingress.kubernetes.io/target-type: ip
-      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
-      # argocd-server exposes no /healthz on the HTTP route; / returns the UI.
-      # A wrong path here marks every target unhealthy and the ALB serves 503.
-      alb.ingress.kubernetes.io/healthcheck-path: /
-      alb.ingress.kubernetes.io/success-codes: "200"
-      # A dedicated ALB. Sharing the monitoring or application group would
-      # couple an admin console's exposure to unrelated services.
-      alb.ingress.kubernetes.io/group.name: argocd
-    path: /
-    pathType: Prefix
+    enabled: false
 
   resources:
     requests:

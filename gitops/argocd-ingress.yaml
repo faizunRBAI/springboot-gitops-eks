@@ -1,0 +1,64 @@
+# Public ALB ingress for the ArgoCD console.
+#
+# WHY THIS IS A HAND-WRITTEN MANIFEST INSTEAD OF THE CHART'S server.ingress:
+#
+# The argo-cd chart (7.7.11) DEFAULTS server.ingress.hostname to the
+# placeholder "argocd.example.com" and does not treat an empty string as
+# "no host". Setting hostname: "" was verified against the live release and
+# ignored — the rendered rule still carried the placeholder host, so the ALB
+# matched only requests with that Host header and every request to the raw ALB
+# DNS name fell through to the default action and returned 404. Meanwhile helm
+# reported success, the rollout succeeded and the Application stayed Healthy,
+# so nothing in the pipeline noticed.
+#
+# The chart also derives argocd-cm's `url` from the same value, which is why
+# overriding it there does not help either.
+#
+# Owning the manifest removes the guesswork: no host key at all means the rule
+# matches ANY hostname, which is what makes the raw ALB address usable without
+# a domain. This mirrors chart/templates/ingress.yaml, which conditionally
+# omits `host` and has worked correctly since it was written.
+#
+# ---------------------------------------------------------------------------
+# INTERNET-EXPOSED — DELIBERATE, EXPLICITLY REQUESTED, TEST/DEMO ONLY.
+#
+# ArgoCD is a CONTROL PLANE, not a dashboard: its admin account can sync,
+# delete and mutate every resource ArgoCD manages. This publishes it to
+# 0.0.0.0/0 over plain HTTP with no TLS and no SSO, so the admin password
+# crosses the internet in cleartext and is the only control.
+#
+# Before this is ever production, all three:
+#   1. TLS via cert-manager + ACM/Route53, redirect 80 -> 443
+#   2. SSO (dex/OIDC) or alb.ingress.kubernetes.io/inbound-cidrs
+#   3. rotate ARGOCD_ADMIN_PASSWORD, since it has travelled unencrypted
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd-server
+  namespace: argocd
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    # argocd-server serves the UI at / and exposes no /healthz on the HTTP
+    # route, so a /healthz health check marks every target unhealthy and the
+    # ALB returns 503 on a server that is working perfectly.
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/success-codes: "200"
+    # A dedicated ALB. Sharing the monitoring or application group would couple
+    # an admin console's exposure to unrelated services' ingress.
+    alb.ingress.kubernetes.io/group.name: argocd
+spec:
+  ingressClassName: alb
+  rules:
+    # No `host` key: match any hostname. Add one here once DNS and TLS exist.
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: argocd-server
+                port:
+                  number: 80

@@ -243,13 +243,23 @@ jobs:
       timeout-minutes: 15
       env:
         ADMIN_SECRET: ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+    - name: Publish the ArgoCD console ingress
+      run: 'set -euo pipefail
+
+        kubectl apply -f gitops/argocd-ingress.yaml
+
+        '
     - name: Assert the ArgoCD ingress is not host-scoped
       run: "set -euo pipefail\nHOST_RULE=$(kubectl -n argocd get ingress argocd-server\
         \ \\\n  -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || echo \"\")\nif\
         \ [ -n \"${HOST_RULE}\" ]; then\n  echo \"ERROR: the ArgoCD ingress rule is\
         \ bound to host '${HOST_RULE}'.\"\n  echo \"Requests to the raw ALB DNS name\
-        \ will return 404.\"\n  echo \"Set server.ingress.hostname: \\\"\\\" in gitops/values/argocd-values.yaml.\"\
-        \n  exit 1\nfi\necho \"ArgoCD ingress matches any host, as intended.\"\n"
+        \ will return 404.\"\n  echo \"The ingress must come from gitops/argocd-ingress.yaml,\
+        \ which\"\n  echo \"omits the host key. Check that server.ingress.enabled\
+        \ is false\"\n  echo \"in gitops/values/argocd-values.yaml \u2014 the chart\
+        \ re-creates a\"\n  echo \"host-scoped ingress of the same name when it is\
+        \ enabled.\"\n  exit 1\nfi\necho \"ArgoCD ingress matches any host, as intended.\"\
+        \n"
     - name: Remove the superseded bootstrap admin secret
       run: 'kubectl -n argocd delete secret argocd-initial-admin-secret --ignore-not-found=true
         || true

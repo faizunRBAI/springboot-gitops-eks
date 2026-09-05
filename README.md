@@ -85,6 +85,11 @@ There is a fourth, subtler guard: ArgoCD `ignoreDifferences` on
 rollout; without this, ArgoCD would see drift and fight the rollouts
 controller — two controllers, one field, flapping forever.
 
+> The one thing CI *does* apply directly is the cluster **platform** — the
+> Helm releases and the ArgoCD console ingress. That is bootstrap, not
+> application delivery: ArgoCD cannot install itself. The application is still
+> reconciled exclusively from Git.
+
 ### Promoting a new image (the one manual step)
 
 CI publishes the image and prints the reference in its job summary. To deploy
@@ -136,7 +141,9 @@ chart/                   Helm chart
 gitops/                  ArgoCD configuration
   root-app.yaml                  ArgoCD Application (app-of-apps entry point)
   application-values.yaml        THE HANDOFF (image tag lives here)
-  values/argocd-values.yaml      ArgoCD install values (PUBLIC ingress)
+  argocd-ingress.yaml            PUBLIC ALB ingress for the ArgoCD console
+                                 (hand-written, not the chart's — see below)
+  values/argocd-values.yaml      ArgoCD install values
   values/monitoring-values.yaml  kube-prometheus-stack values (PUBLIC Grafana)
 infra/                   Terraform (AWS)
   network.tf             VPC, 3 AZs, single NAT gateway
@@ -154,6 +161,20 @@ infra/                   Terraform (AWS)
 
 > `.github/workflows/*.yml` are generated from `.udap/pipeline.yaml`.
 > Edit the spec, not the rendered files; the next render overwrites them.
+
+### Why the ArgoCD ingress is hand-written
+
+`gitops/argocd-ingress.yaml` exists instead of the chart's `server.ingress`
+because the argo-cd chart (7.7.11) **defaults its ingress hostname to
+`argocd.example.com` and ignores an empty string**. The rendered rule is
+therefore always host-scoped, so the ALB matches only requests carrying that
+Host header and every request to the raw ALB DNS name returns **404** — while
+`helm upgrade` reports success, the rollout succeeds and the Application stays
+Healthy. Nothing in a normal pipeline notices.
+
+The hand-written manifest omits `host` entirely, which matches any hostname.
+`server.ingress.enabled` is `false` in the values file, and the configure stage
+asserts the rendered rule has no host before the deploy is allowed to pass.
 
 ---
 
@@ -276,8 +297,9 @@ leaks.
 - **Private nodes.** Workers have no public IPs; egress goes through the NAT.
 - **No secrets in Git.** All credentials are repository secrets referenced as
   `${{ secrets.NAME }}`; none are committed. The ArgoCD admin password is
-  bcrypt-hashed at install time by the `argocd` binary in its own image, so
-  neither the plaintext nor the hash is ever committed.
+  bcrypt-hashed in the configure stage with `htpasswd -niBC 10` reading the
+  secret from **stdin** — so the plaintext never appears as a process argument
+  and neither it nor the hash is ever committed.
 - **CI cannot write to the repository**, which removes an entire class of
   supply-chain risk — though here it is a platform constraint rather than a
   deliberate choice (see above).
@@ -424,11 +446,13 @@ and all configuration survive, so redeploying later is a single action.
 1. **Provision** — Terraform builds the VPC, EKS, ECR, EBS CSI and IAM.
 2. **Build and push** — image built, Trivy-scanned, pushed to ECR.
 3. **Configure** — installs the Load Balancer Controller, Argo Rollouts,
-   kube-prometheus-stack and ArgoCD (rotating the ArgoCD admin password).
+   kube-prometheus-stack and ArgoCD (rotating the ArgoCD admin password),
+   publishes the ArgoCD console ingress and asserts it is not host-scoped.
 4. **GitOps handoff** — verifies the committed values are concrete and applies
    the ArgoCD root Application.
 5. **Verify** — waits for ArgoCD to report the application Healthy, probes the
-   ALB, and reports the public console addresses.
+   application ALB, and **probes the public ArgoCD console, failing the deploy
+   if it does not return 200**.
 
 Afterwards, every `app/**` commit runs the `app-delivery` workflow, which
 publishes a new image and prints the tag to promote.
