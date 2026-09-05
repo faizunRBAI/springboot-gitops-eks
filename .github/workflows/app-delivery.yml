@@ -67,7 +67,6 @@ jobs:
         exit-code: '1'
         severity: HIGH,CRITICAL
         ignore-unfixed: 'true'
-        version: v0.58.2
     - name: Authenticate to AWS via OIDC
       uses: aws-actions/configure-aws-credentials@v4
       with:

@@ -127,7 +127,6 @@ jobs:
         exit-code: '1'
         severity: HIGH,CRITICAL
         ignore-unfixed: 'true'
-        version: v0.58.2
     - name: Verify the OIDC role secret is present
       run: "set -euo pipefail\nif [ -z \"${CI_ROLE_ARN}\" ]; then\n  echo \"AWS_CI_ROLE_ARN\
         \ is not set.\"\n  echo \"\"\n  echo \"It is created by the provision stage\

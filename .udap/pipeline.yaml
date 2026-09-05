@@ -135,11 +135,13 @@ stages:
       # JARs inside the image, so Java CVEs are caught at the deployed artifact.
       # exit-code 1: a HIGH/CRITICAL finding fails the build before any push.
       #
-      # The action is referenced by @master, which is the reference the project
-      # documents. Numeric tags for this action are easy to get wrong and a
-      # nonexistent tag fails during GitHub's pre-flight action resolution,
-      # killing the job before any step runs. Reproducibility is preserved by
-      # pinning the SCANNER version below rather than the action wrapper.
+      # DO NOT ADD a `version:` input here. Pinning the scanner version makes
+      # the action take an install path that writes the binary to
+      # $HOME/.local/bin/trivy-bin WITHOUT creating that directory, and the
+      # installer exits 1 immediately after reporting "found version". The
+      # default path works. Likewise do not pin the action to a numeric tag:
+      # a nonexistent tag fails GitHub's pre-flight resolution and the job
+      # never starts.
       - name: Scan image with Trivy
         uses: aquasecurity/trivy-action@master
         with:
@@ -148,7 +150,6 @@ stages:
           exit-code: "1"
           severity: HIGH,CRITICAL
           ignore-unfixed: "true"
-          version: v0.58.2
       - name: Verify the OIDC role secret is present
         env:
           CI_ROLE_ARN: ${{ secrets.AWS_CI_ROLE_ARN }}
@@ -464,9 +465,10 @@ pipelines:
           - name: Build image
             working-directory: app
             run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
-          # Same reference as the deploy pipeline: @master with the scanner
-          # version pinned. A nonexistent numeric action tag fails GitHub's
-          # pre-flight resolution and kills the job before any step runs.
+          # Same contract as the deploy pipeline: @master, and NO `version:`
+          # input. Pinning the scanner version makes the installer write to a
+          # directory it never creates and exit 1 right after reporting
+          # "found version".
           - name: Scan image with Trivy
             uses: aquasecurity/trivy-action@master
             with:
@@ -475,7 +477,6 @@ pipelines:
               exit-code: "1"
               severity: HIGH,CRITICAL
               ignore-unfixed: "true"
-              version: v0.58.2
           - name: Authenticate to AWS via OIDC
             uses: aws-actions/configure-aws-credentials@v4
             with:
