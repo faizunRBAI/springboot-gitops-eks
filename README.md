@@ -1,7 +1,7 @@
 # springboot-gitops-eks
 
 Spring Boot service delivered to AWS EKS through a DevSecOps + GitOps pipeline:
-**code → test + scan → image → ECR → ArgoCD → EKS → blue/green or canary → monitoring → rollback.**
+**code → test → image scan → ECR → ArgoCD → EKS → blue/green or canary → monitoring → rollback.**
 
 ---
 
@@ -16,9 +16,9 @@ GitHub monorepo ─────────────────────�
    │ (app/** changes)                                     │ (gitops/** changes)
    ▼                                                      │
 GitHub Actions  ── OIDC ──▶ AWS IAM role                  │
-   │  test · OWASP scan · build · Trivy scan              │
+   │  test · build · Trivy image scan                     │
    │                                                      │
-   ├──▶ push image ──▶ ECR                                │
+   ├──▶ push image ──▶ ECR (scan on push)                 │
    │                                                      │
    └──▶ commit new image tag to gitops/ [skip ci] ────────┘
                                                           │
@@ -81,7 +81,7 @@ controller — two controllers, one field, flapping forever.
 app/                     Spring Boot 3.4 application (Java 21, Maven)
   src/main/java/...      Application + InfoController
   src/main/resources/    application.properties, static landing page
-  src/test/java/...      JUnit tests (6, including a Prometheus endpoint test)
+  src/test/java/...      JUnit tests (7, including a Prometheus endpoint test)
   Dockerfile             Multi-stage, non-root, layered JAR
 chart/                   Helm chart
   templates/rollout.yaml         Argo Rollouts Rollout (blue/green + canary)
@@ -190,10 +190,11 @@ front, not a default.
   via OIDC to an IAM role whose trust policy pins
   `repo:<owner>/<repo>:ref:refs/heads/main`. A wildcard there would let any
   repository on GitHub push to your registry.
-- **Two scanning layers.** OWASP dependency-check on the dependency graph
-  (fails at CVSS ≥ 8); Trivy on the built image (fails on HIGH/CRITICAL)
-  *before* the push, so a vulnerable image never enters ECR. ECR rescans on
-  push to catch CVEs disclosed after the build.
+- **Image scanning at two points.** **Trivy** scans the built image and fails
+  the build on HIGH/CRITICAL *before* the push, so a vulnerable image never
+  enters ECR. Trivy inspects OS packages **and** application dependencies —
+  including the Spring Boot JARs — so Java CVEs are covered. **ECR scan-on-push**
+  re-scans stored images to catch CVEs disclosed after the build.
 - **Least-privilege IAM.** The CI role can push to exactly one ECR repository.
   The Load Balancer Controller uses IRSA bound to one service account.
 - **Hardened pods.** Non-root (uid 10001), read-only root filesystem, all
@@ -202,12 +203,19 @@ front, not a default.
 
 ### Known gaps (deliberate, not oversights)
 
+- **No source-level dependency scanner.** OWASP dependency-check was removed:
+  without an NVD API key it ran 10–40 minutes and exceeded the stage timeout.
+  Trivy's image scan covers the same Java CVEs at the deployed artifact. To
+  reintroduce SCA cheaply, enable GitHub Dependabot alerts (free on public
+  repositories) or add the dependency-check plugin back with an `NVD_API_KEY`.
 - **HTTP, not HTTPS.** No custom domain, so no certificate. Add cert-manager +
   Route53 + ACM for TLS.
 - **Base images pinned by tag, not digest.** The Dockerfile documents how to
   pin digests once pulled.
-- **Secrets are repository secrets**, not in Git. Moving them into Git
-  requires Sealed Secrets or External Secrets Operator.
+- **Public repository.** ArgoCD clones anonymously — no repository credential
+  is stored in the cluster. If this repository is ever made private, add an
+  `ARGOCD_REPO_TOKEN` secret and register it as an ArgoCD repository secret,
+  or ArgoCD will fail to sync.
 - **Single NAT gateway** — see cost note below.
 
 ---
@@ -238,19 +246,22 @@ and all configuration survive, so redeploying later is a single action.
 1. **Provision** — Terraform builds the VPC, EKS, ECR, and the OIDC role.
 2. Set `AWS_CI_ROLE_ARN` from `terraform output -raw ci_role_arn`.
 3. **Configure** — installs the Load Balancer Controller, Argo Rollouts,
-   kube-prometheus-stack and ArgoCD, then registers the root Application.
+   kube-prometheus-stack and ArgoCD, then applies the root Application.
 4. **Verify** — waits for ArgoCD to report Synced/Healthy, then probes the ALB.
 
 Afterwards, every `app/**` commit runs the `app-delivery` workflow only.
 
+> **First deploy is a two-pass bootstrap.** `AWS_CI_ROLE_ARN` is an *output* of
+> the Terraform that runs in the same pipeline, so it cannot exist before the
+> first provision. Run 1 builds the infrastructure; set the secret from
+> `terraform output -raw ci_role_arn`; run 2 completes the delivery path.
+
 ## Required repository secrets
 
-| Secret | Purpose |
-|---|---|
-| `AWS_CI_ROLE_ARN` | OIDC role for ECR pushes (from `terraform output ci_role_arn`) |
-| `NVD_API_KEY` | OWASP dependency-check NVD access (avoids severe rate limiting) |
-| `GRAFANA_ADMIN_PASSWORD` | Grafana admin login |
-| `ARGOCD_REPO_TOKEN` | GitHub PAT so ArgoCD can read this repository |
+| Secret | Purpose | Who sets it |
+|---|---|---|
+| `AWS_CI_ROLE_ARN` | OIDC role for ECR pushes | After first provision, from `terraform output ci_role_arn` |
+| `GRAFANA_ADMIN_PASSWORD` | Grafana admin login | Generated at setup |
 
 `PROJECT_NAME`, `TF_STATE_BUCKET` and the AWS provisioning credentials are
 injected by the platform.

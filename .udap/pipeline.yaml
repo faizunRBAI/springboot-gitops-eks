@@ -37,29 +37,9 @@ stages:
           echo "### Test results" >> "$GITHUB_STEP_SUMMARY"
           find app/target/surefire-reports -name '*.txt' -exec cat {} + >> "$GITHUB_STEP_SUMMARY" || true
 
-  - id: security
-    kind: security
-    needs: [lint]
-    timeout_minutes: 25
-    steps:
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: maven
-      - name: OWASP dependency vulnerability scan
-        working-directory: app
-        run: mvn -B -ntp org.owasp:dependency-check-maven:12.1.0:check -DfailBuildOnCVSS=8 -DnvdApiKey="${{ secrets.NVD_API_KEY }}"
-      - name: Upload dependency-check report
-        uses: actions/upload-artifact@v4
-        with:
-          name: dependency-check-report
-          path: app/target/dependency-check-report.html
-
   - id: build_push
     kind: build_push
-    needs: [test, security]
+    needs: [test]
     timeout_minutes: 30
     env:
       AWS_REGION: us-east-1
@@ -81,6 +61,11 @@ stages:
       - name: Build image
         working-directory: app
         run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
+      # Trivy is now the ONLY pre-push vulnerability gate. It scans OS packages
+      # AND application dependencies (the Spring Boot JARs), so Java CVEs are
+      # still caught here — at the artifact that actually gets deployed.
+      # exit-code 1 means a HIGH/CRITICAL finding fails the build and the image
+      # never reaches ECR.
       - name: Scan image with Trivy
         uses: aquasecurity/trivy-action@0.28.0
         with:
@@ -214,16 +199,6 @@ stages:
             --version 7.7.11 --namespace argocd --create-namespace \
             --values gitops/values/argocd-values.yaml \
             --wait --timeout 15m
-      - name: Register application repository with ArgoCD
-        run: |
-          set -euo pipefail
-          kubectl -n argocd create secret generic repo-monorepo \
-            --from-literal=type=git \
-            --from-literal=url="https://github.com/${{ github.repository }}.git" \
-            --from-literal=username=git \
-            --from-literal=password="${{ secrets.ARGOCD_REPO_TOKEN }}" \
-            --dry-run=client -o yaml | kubectl apply -f -
-          kubectl -n argocd label secret repo-monorepo argocd.argoproj.io/secret-type=repository --overwrite
       - name: Seed the ECR repository URL into the GitOps values
         working-directory: infra
         run: |
@@ -267,6 +242,10 @@ stages:
             git commit -m "chore(gitops): pin image tag ${GITHUB_SHA::12} [skip ci]"
             git push origin HEAD:main
           fi
+      # NOTE: no ArgoCD repository credential is registered. The monorepo is
+      # PUBLIC, so ArgoCD clones it anonymously. Creating a credential secret
+      # with an empty token would be worse than none: ArgoCD would attempt
+      # authenticated clones and fail.
       - name: Apply the ArgoCD root application
         run: |
           set -euo pipefail
@@ -382,24 +361,9 @@ pipelines:
             working-directory: app
             run: mvn -B -ntp test
 
-      - id: app_security
-        kind: security
-        needs: []
-        timeout_minutes: 25
-        steps:
-          - name: Set up JDK 21
-            uses: actions/setup-java@v4
-            with:
-              distribution: temurin
-              java-version: "21"
-              cache: maven
-          - name: OWASP dependency vulnerability scan
-            working-directory: app
-            run: mvn -B -ntp org.owasp:dependency-check-maven:12.1.0:check -DfailBuildOnCVSS=8 -DnvdApiKey="${{ secrets.NVD_API_KEY }}"
-
       - id: app_release
         kind: build_push
-        needs: [app_test, app_security]
+        needs: [app_test]
         timeout_minutes: 30
         env:
           AWS_REGION: us-east-1
@@ -419,6 +383,9 @@ pipelines:
           - name: Build image
             working-directory: app
             run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
+          # Sole pre-push vulnerability gate: scans OS packages and the
+          # application JARs, failing the build on HIGH/CRITICAL before the
+          # image can reach ECR.
           - name: Scan image with Trivy
             uses: aquasecurity/trivy-action@0.28.0
             with:

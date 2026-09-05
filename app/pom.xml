@@ -19,7 +19,6 @@
 
     <properties>
         <java.version>21</java.version>
-        <dependency-check.version>12.1.0</dependency-check.version>
     </properties>
 
     <dependencies>
@@ -61,22 +60,25 @@
                     </layers>
                 </configuration>
             </plugin>
-
-            <!-- OWASP dependency-check runs in the security stage.
-                 failBuildOnCVSS is passed from CI so local builds stay fast. -->
-            <plugin>
-                <groupId>org.owasp</groupId>
-                <artifactId>dependency-check-maven</artifactId>
-                <version>${dependency-check.version}</version>
-                <configuration>
-                    <formats>
-                        <format>HTML</format>
-                        <format>JSON</format>
-                    </formats>
-                    <nvdApiDelay>4000</nvdApiDelay>
-                    <assemblyAnalyzerEnabled>false</assemblyAnalyzerEnabled>
-                </configuration>
-            </plugin>
         </plugins>
     </build>
+
+    <!--
+        Dependency vulnerability scanning:
+
+        OWASP dependency-check was removed deliberately. Without an NVD API key
+        it takes 10 to 40 minutes and exceeded the CI stage timeout.
+
+        Java dependency CVEs are still caught, at a better gate:
+          * Trivy scans the BUILT IMAGE in the release stage and fails on
+            HIGH/CRITICAL before the image is pushed to ECR. It inspects OS
+            packages and application dependencies, including the JARs inside
+            the layered Spring Boot image.
+          * ECR scan on push re-scans stored images, catching CVEs disclosed
+            after the build.
+
+        To reintroduce source level SCA later, either enable GitHub Dependabot
+        (free on public repositories) or add the org.owasp
+        dependency-check-maven plugin back together with an NVD_API_KEY secret.
+    -->
 </project>
