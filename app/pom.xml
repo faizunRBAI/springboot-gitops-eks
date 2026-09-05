@@ -4,10 +4,36 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
+    <!--
+        Spring Boot 3.5.16. This version was VERIFIED to exist by listing the
+        release tags of the upstream spring-boot repository, not assumed.
+        Never bump this to a version you have not checked: a nonexistent
+        parent POM fails the build at dependency resolution.
+
+        WHY THIS VERSION, and not 3.4.x with a tomcat.version override:
+        Trivy's first scan reported Tomcat CVEs fixed in 10.1.42 and 10.1.44,
+        so tomcat.version was pinned to 10.1.44 on Boot 3.4.1. The next scan
+        then surfaced FURTHER advisories needing 10.1.45 and 10.1.52.
+        Hand pinning a single transitive component means chasing advisories one
+        scan at a time, against a parent POM whose other managed versions were
+        never tested with that Tomcat.
+
+        The 3.5.x line ships a current Tomcat as part of a coherent, tested
+        dependency set. No tomcat.version override is set here on purpose:
+        Boot's dependency management supplies the patched version, and pinning
+        it back would reintroduce the problem.
+
+        When Trivy reports new framework CVEs, bump THIS version first, and
+        verify the target release exists before committing.
+
+        NOTE TO FUTURE EDITORS: XML forbids a double hyphen inside a comment
+        body. Do not paste command lines containing option flags here, and do
+        not use hyphen rules as underlines. It makes the POM non parseable.
+    -->
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.4.1</version>
+        <version>3.5.16</version>
         <relativePath/>
     </parent>
 
@@ -19,27 +45,6 @@
 
     <properties>
         <java.version>21</java.version>
-
-        <!--
-            SECURITY OVERRIDE - embedded Tomcat.
-
-            Trivy failed the build on HIGH/CRITICAL CVEs in the Tomcat that
-            spring-boot-starter-web pulls in transitively at Boot 3.4.1:
-
-              CVE-2025-48988  DoS in multipart upload      fixed in 10.1.42
-              CVE-2025-48989  HTTP/2 "MadeYouReset" DoS     fixed in 10.1.44
-              CVE-2026-68525  FORM authentication bypass
-
-            spring-boot-starter-parent exposes tomcat.version precisely so a
-            patched Tomcat can be adopted without waiting for the next Boot
-            release. 10.1.44 is the lowest version that covers all three.
-
-            Raise this when new advisories land. Do NOT instead relax the
-            Trivy severity threshold or set exit-code 0: that hides the
-            vulnerability rather than removing it, and the image would ship
-            with a known remote DoS.
-        -->
-        <tomcat.version>10.1.44</tomcat.version>
     </properties>
 
     <dependencies>
@@ -94,13 +99,13 @@
           * Trivy scans the BUILT IMAGE in the release stage and fails on
             HIGH/CRITICAL before the image is pushed to ECR. It inspects OS
             packages and application dependencies, including the JARs inside
-            the layered Spring Boot image. The tomcat.version override above
-            exists because Trivy caught exactly this class of issue.
+            the layered Spring Boot image. It caught the Tomcat advisories that
+            drove the Boot version above.
           * ECR scan on push re-scans stored images, catching CVEs disclosed
             after the build.
 
-        To reintroduce source level SCA later, either enable GitHub Dependabot
-        (free on public repositories) or add the org.owasp
-        dependency-check-maven plugin back together with an NVD_API_KEY secret.
+        Keeping this green over time means bumping the Boot version when new
+        advisories land, not relaxing the scanner. Enable GitHub Dependabot
+        (free on public repositories) to get those bumps proposed automatically.
     -->
 </project>
