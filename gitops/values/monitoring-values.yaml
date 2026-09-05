@@ -23,9 +23,18 @@ prometheus:
       limits:
         memory: 2Gi
 
+    # storageClassName is named EXPLICITLY rather than relying on the cluster
+    # default. The gp3 class and the EBS CSI driver that backs it are created
+    # in infra/ebs-csi.tf; EKS ships no working storage class of its own since
+    # the in-tree AWS provisioner was removed in Kubernetes 1.23.
+    #
+    # If this claim cannot bind, the pod never schedules and the symptom is:
+    #   FailedScheduling: pod has unbound immediate PersistentVolumeClaims
+    # which reads like a capacity problem but is a storage-class problem.
     storageSpec:
       volumeClaimTemplate:
         spec:
+          storageClassName: gp3
           accessModes: ["ReadWriteOnce"]
           resources:
             requests:
@@ -36,6 +45,13 @@ grafana:
   # repository secret. Never commit a value here.
   service:
     type: ClusterIP
+
+  # Grafana's own dashboards and settings are disposable — they are declared
+  # in this file, so an ephemeral volume loses nothing that is not recreated
+  # on the next install. Prometheus keeps durable storage because its metric
+  # history is what canary analysis reads.
+  persistence:
+    enabled: false
 
   resources:
     requests:
@@ -73,6 +89,10 @@ grafana:
 
 alertmanager:
   alertmanagerSpec:
+    # Alertmanager's state is silences and notification history — recreatable,
+    # and not worth a second EBS volume on a two-node cluster.
+    storage: {}
+
     resources:
       requests:
         cpu: 50m
