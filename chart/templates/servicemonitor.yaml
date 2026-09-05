@@ -3,7 +3,7 @@
 #
 # This is the link that makes canary analysis possible: no ServiceMonitor,
 # no metrics in Prometheus, and every AnalysisRun errors with "no datapoints"
-# — which Argo Rollouts treats as inconclusive and the rollout stalls.
+# which Argo Rollouts treats as inconclusive, and the rollout stalls.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -27,11 +27,22 @@ spec:
       interval: {{ .Values.serviceMonitor.interval }}
       # Relabelling so the AnalysisTemplate queries can filter by
       # kubernetes_namespace and service.
+      #
+      # `action: replace` MUST be written explicitly even though it is the
+      # default. The Prometheus Operator CRD schema defaults the field
+      # server-side, so an omitted `action` comes back as `action: replace`
+      # on the live object. ArgoCD then diffs Git (no action) against the
+      # cluster (action: replace) and reports the ServiceMonitor OutOfSync
+      # forever, because the two can never converge. Writing the default
+      # explicitly makes Git match what the API server actually stores.
       relabelings:
-        - sourceLabels: [__meta_kubernetes_namespace]
+        - action: replace
+          sourceLabels: [__meta_kubernetes_namespace]
           targetLabel: kubernetes_namespace
-        - sourceLabels: [__meta_kubernetes_service_name]
+        - action: replace
+          sourceLabels: [__meta_kubernetes_service_name]
           targetLabel: service
-        - sourceLabels: [__meta_kubernetes_pod_name]
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_name]
           targetLabel: pod
 {{- end }}

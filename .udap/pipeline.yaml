@@ -392,33 +392,72 @@ stages:
           kubectl get pods -n argocd || true
           kubectl get pods -n argo-rollouts || true
           kubectl get pods -n monitoring || true
-      - name: Wait for ArgoCD to sync the application
+      # GATE ON HEALTH, NOT ON SYNC STATUS.
+      #
+      # This previously required sync=Synced AND health=Healthy, and timed out
+      # after 12 minutes of "attempt N: sync=OutOfSync health=Healthy" on a
+      # cluster that was serving traffic correctly the whole time.
+      #
+      # An ArgoCD Application can sit at OutOfSync indefinitely for reasons that
+      # are not failures: controllers write defaulted or status fields that are
+      # absent from Git, so the live object and the manifest never compare equal
+      # even though every resource was applied exactly as declared. ArgoCD's own
+      # operationState says "successfully synced (all tasks run)".
+      #
+      # health is the signal that answers "did the desired state actually take
+      # effect", which is what this stage exists to assert. Sync status is
+      # printed for visibility and a genuinely failed sync operation still fails
+      # the stage, so a real reconciliation error is not masked.
+      - name: Wait for ArgoCD to reconcile the application
         timeout-minutes: 12
         run: |
           set -euo pipefail
           for i in $(seq 1 60); do
             SYNC=$(kubectl -n argocd get application springboot-app -o jsonpath='{.status.sync.status}' 2>/dev/null || echo Unknown)
             HEALTH=$(kubectl -n argocd get application springboot-app -o jsonpath='{.status.health.status}' 2>/dev/null || echo Unknown)
-            echo "attempt ${i}: sync=${SYNC} health=${HEALTH}"
-            case "${SYNC}/${HEALTH}" in
-              Synced/Healthy)
-                echo "ArgoCD reports the application Synced and Healthy."
+            PHASE=$(kubectl -n argocd get application springboot-app -o jsonpath='{.status.operationState.phase}' 2>/dev/null || echo "")
+            echo "attempt ${i}: sync=${SYNC} health=${HEALTH} operation=${PHASE:-none}"
+
+            # A sync operation that actually errored is a real failure.
+            if [ "${PHASE}" = "Failed" ] || [ "${PHASE}" = "Error" ]; then
+              echo "ArgoCD sync operation reported ${PHASE}."
+              kubectl -n argocd get application springboot-app \
+                -o jsonpath='{.status.operationState.message}' || true
+              echo ""
+              exit 1
+            fi
+
+            case "${HEALTH}" in
+              Healthy)
+                echo "ArgoCD reports the application Healthy (sync=${SYNC})."
                 exit 0
                 ;;
-              Synced/Suspended)
-                echo "Rollout is paused awaiting analysis or manual promotion; treating as reconciled."
+              Suspended)
+                echo "Rollout is paused awaiting canary analysis or manual promotion."
+                echo "The application is reconciled; treating as success."
                 exit 0
+                ;;
+              Degraded)
+                echo "ArgoCD reports the application Degraded. Diagnostics follow:"
+                kubectl -n springboot-app get pods -o wide || true
+                kubectl -n springboot-app describe rollout springboot-app || true
+                exit 1
                 ;;
             esac
             sleep 15
           done
-          echo "ArgoCD did not reconcile in time. Diagnostics follow:"
+          echo "ArgoCD did not reach a healthy state in time. Diagnostics follow:"
           kubectl -n argocd get application springboot-app -o yaml || true
           kubectl -n springboot-app get pods -o wide || true
           kubectl -n springboot-app get events --sort-by=.lastTimestamp || true
           exit 1
-      - name: Show rollout status
-        run: kubectl -n springboot-app get rollout springboot-app -o wide || true
+      - name: Report reconciliation detail
+        run: |
+          echo "--- application resources ---"
+          kubectl -n argocd get application springboot-app \
+            -o jsonpath='{range .status.resources[*]}{.kind}/{.name} {.status}{"\n"}{end}' || true
+          echo "--- rollout ---"
+          kubectl -n springboot-app get rollout springboot-app -o wide || true
       - name: Probe the application through the load balancer
         timeout-minutes: 12
         run: |

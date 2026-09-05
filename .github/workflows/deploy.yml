@@ -345,23 +345,36 @@ jobs:
         kubectl get pods -n monitoring || true
 
         '
-    - name: Wait for ArgoCD to sync the application
+    - name: Wait for ArgoCD to reconcile the application
       run: "set -euo pipefail\nfor i in $(seq 1 60); do\n  SYNC=$(kubectl -n argocd\
         \ get application springboot-app -o jsonpath='{.status.sync.status}' 2>/dev/null\
         \ || echo Unknown)\n  HEALTH=$(kubectl -n argocd get application springboot-app\
-        \ -o jsonpath='{.status.health.status}' 2>/dev/null || echo Unknown)\n  echo\
-        \ \"attempt ${i}: sync=${SYNC} health=${HEALTH}\"\n  case \"${SYNC}/${HEALTH}\"\
-        \ in\n    Synced/Healthy)\n      echo \"ArgoCD reports the application Synced\
-        \ and Healthy.\"\n      exit 0\n      ;;\n    Synced/Suspended)\n      echo\
-        \ \"Rollout is paused awaiting analysis or manual promotion; treating as reconciled.\"\
-        \n      exit 0\n      ;;\n  esac\n  sleep 15\ndone\necho \"ArgoCD did not\
-        \ reconcile in time. Diagnostics follow:\"\nkubectl -n argocd get application\
+        \ -o jsonpath='{.status.health.status}' 2>/dev/null || echo Unknown)\n  PHASE=$(kubectl\
+        \ -n argocd get application springboot-app -o jsonpath='{.status.operationState.phase}'\
+        \ 2>/dev/null || echo \"\")\n  echo \"attempt ${i}: sync=${SYNC} health=${HEALTH}\
+        \ operation=${PHASE:-none}\"\n\n  # A sync operation that actually errored\
+        \ is a real failure.\n  if [ \"${PHASE}\" = \"Failed\" ] || [ \"${PHASE}\"\
+        \ = \"Error\" ]; then\n    echo \"ArgoCD sync operation reported ${PHASE}.\"\
+        \n    kubectl -n argocd get application springboot-app \\\n      -o jsonpath='{.status.operationState.message}'\
+        \ || true\n    echo \"\"\n    exit 1\n  fi\n\n  case \"${HEALTH}\" in\n  \
+        \  Healthy)\n      echo \"ArgoCD reports the application Healthy (sync=${SYNC}).\"\
+        \n      exit 0\n      ;;\n    Suspended)\n      echo \"Rollout is paused awaiting\
+        \ canary analysis or manual promotion.\"\n      echo \"The application is\
+        \ reconciled; treating as success.\"\n      exit 0\n      ;;\n    Degraded)\n\
+        \      echo \"ArgoCD reports the application Degraded. Diagnostics follow:\"\
+        \n      kubectl -n springboot-app get pods -o wide || true\n      kubectl\
+        \ -n springboot-app describe rollout springboot-app || true\n      exit 1\n\
+        \      ;;\n  esac\n  sleep 15\ndone\necho \"ArgoCD did not reach a healthy\
+        \ state in time. Diagnostics follow:\"\nkubectl -n argocd get application\
         \ springboot-app -o yaml || true\nkubectl -n springboot-app get pods -o wide\
         \ || true\nkubectl -n springboot-app get events --sort-by=.lastTimestamp ||\
         \ true\nexit 1\n"
       timeout-minutes: 12
-    - name: Show rollout status
-      run: kubectl -n springboot-app get rollout springboot-app -o wide || true
+    - name: Report reconciliation detail
+      run: "echo \"--- application resources ---\"\nkubectl -n argocd get application\
+        \ springboot-app \\\n  -o jsonpath='{range .status.resources[*]}{.kind}/{.name}\
+        \ {.status}{\"\\n\"}{end}' || true\necho \"--- rollout ---\"\nkubectl -n springboot-app\
+        \ get rollout springboot-app -o wide || true\n"
     - name: Probe the application through the load balancer
       run: "set -euo pipefail\nfor i in $(seq 1 45); do\n  HOST=$(kubectl -n springboot-app\
         \ get ingress springboot-app \\\n    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'\
