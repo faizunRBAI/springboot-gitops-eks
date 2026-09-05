@@ -11,13 +11,14 @@
 #   3. CI holds no cluster credentials for application deployment.
 # Removing any one of these still leaves two; do not treat them as redundant.
 #
-# image.repository is set once from `terraform output -raw ecr_repository_url`.
-# image.tag is rewritten by CI on every delivery.
+# image.repository is stable — it is this project's ECR repository.
+# image.tag is rewritten by the gitops_handoff stage (first deploy) and by the
+# app-delivery pipeline (every subsequent application commit).
 # ---------------------------------------------------------------------------
 
 image:
-  repository: PLACEHOLDER_ECR_REPOSITORY
-  tag: PLACEHOLDER_IMAGE_TAG
+  repository: 241533126054.dkr.ecr.us-east-1.amazonaws.com/springboot-gitops-eks
+  tag: 7b0a4419452e
 
 replicaCount: 3
 
