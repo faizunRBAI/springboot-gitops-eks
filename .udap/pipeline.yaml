@@ -37,63 +37,15 @@ stages:
           echo "### Test results" >> "$GITHUB_STEP_SUMMARY"
           find app/target/surefire-reports -name '*.txt' -exec cat {} + >> "$GITHUB_STEP_SUMMARY" || true
 
-  - id: build_push
-    kind: build_push
-    needs: [test]
-    timeout_minutes: 30
-    env:
-      AWS_REGION: us-east-1
-    outputs:
-      image_tag: "${{ steps.meta.outputs.image_tag }}"
-    steps:
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: maven
-      - name: Package application
-        working-directory: app
-        run: mvn -B -ntp clean package -DskipTests
-      - name: Derive image tag
-        id: meta
-        run: echo "image_tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
-      - name: Build image
-        working-directory: app
-        run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
-      # Trivy is now the ONLY pre-push vulnerability gate. It scans OS packages
-      # AND application dependencies (the Spring Boot JARs), so Java CVEs are
-      # still caught here — at the artifact that actually gets deployed.
-      # exit-code 1 means a HIGH/CRITICAL finding fails the build and the image
-      # never reaches ECR.
-      - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: local/app:${{ steps.meta.outputs.image_tag }}
-          format: table
-          exit-code: "1"
-          severity: HIGH,CRITICAL
-          ignore-unfixed: "true"
-      - name: Authenticate to AWS via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
-          aws-region: us-east-1
-      - name: Log in to ECR
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
-      - name: Tag and push image
-        env:
-          REGISTRY: ${{ steps.ecr.outputs.registry }}
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.meta.outputs.image_tag }}"
-          docker tag "local/app:${TAG}" "${REGISTRY}/${{ secrets.PROJECT_NAME }}:${TAG}"
-          docker push "${REGISTRY}/${{ secrets.PROJECT_NAME }}:${TAG}"
-
+  # PROVISION RUNS BEFORE BUILD_PUSH.
+  # Terraform creates the ECR repository AND the GitHub OIDC role that
+  # build_push authenticates with. Building first would mean pushing to a
+  # registry that does not exist yet, using a role that has not been created.
+  # On a first deploy this ordering means the infrastructure is fully built
+  # even though the image push cannot succeed until AWS_CI_ROLE_ARN is set.
   - id: provision
     kind: provision
-    needs: [build_push]
+    needs: [test]
     timeout_minutes: 45
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -120,10 +72,121 @@ stages:
       - name: Terraform apply
         working-directory: infra
         run: terraform apply -input=false -auto-approve
+      - name: Report the CI role ARN for the AWS_CI_ROLE_ARN secret
+        working-directory: infra
+        run: |
+          set -euo pipefail
+          {
+            echo "### Infrastructure ready"
+            echo ""
+            echo "If this is the first deploy, set the AWS_CI_ROLE_ARN"
+            echo "repository secret to the value below and run deploy again."
+            echo ""
+            echo '```'
+            terraform output -raw ci_role_arn
+            echo ""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "ci_role_arn recorded in the job summary."
+
+  - id: build_push
+    kind: build_push
+    needs: [provision]
+    timeout_minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_region: us-east-1
+      TF_VAR_github_repo: ${{ github.repository }}
+    steps:
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      # Read the ECR URL from state rather than reconstructing it from a name
+      # pattern. This job is self-sufficient: it does not consume job outputs
+      # from provision, which GitHub would drop because they embed PROJECT_NAME.
+      - name: Read the ECR repository URL from terraform state
+        id: tf
+        working-directory: infra
+        run: |
+          set -euo pipefail
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+          echo "ecr_url=$(terraform output -raw ecr_repository_url)" >> "$GITHUB_OUTPUT"
+      - name: Package application
+        working-directory: app
+        run: mvn -B -ntp clean package -DskipTests
+      - name: Derive image tag
+        id: meta
+        run: echo "image_tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - name: Build image
+        working-directory: app
+        run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
+      # Sole pre-push vulnerability gate. Scans OS packages AND the Spring Boot
+      # JARs inside the image, so Java CVEs are caught at the deployed artifact.
+      # exit-code 1: a HIGH/CRITICAL finding fails the build before any push.
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: local/app:${{ steps.meta.outputs.image_tag }}
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: "true"
+      # FIRST-DEPLOY NOTE: AWS_CI_ROLE_ARN is created by the provision stage of
+      # this same run, so on a first deploy it is empty and this step fails with
+      # a clear message. The infrastructure above is already built; set the
+      # secret from the provision job summary and run deploy again.
+      - name: Verify the OIDC role secret is present
+        env:
+          CI_ROLE_ARN: ${{ secrets.AWS_CI_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CI_ROLE_ARN}" ]; then
+            echo "AWS_CI_ROLE_ARN is not set."
+            echo ""
+            echo "This is expected on the FIRST deploy: the OIDC role is created"
+            echo "by the provision stage that just completed, so the secret"
+            echo "cannot have existed when this run started."
+            echo ""
+            echo "The infrastructure (VPC, EKS, ECR, OIDC role) is now built."
+            echo "Copy ci_role_arn from the provision job summary into the"
+            echo "AWS_CI_ROLE_ARN repository secret, then run deploy again."
+            exit 1
+          fi
+          echo "AWS_CI_ROLE_ARN is configured."
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Tag and push image to ECR
+        env:
+          ECR_URL: ${{ steps.tf.outputs.ecr_url }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.image_tag }}"
+          docker tag "local/app:${TAG}" "${ECR_URL}:${TAG}"
+          docker push "${ECR_URL}:${TAG}"
+          echo "Pushed ${TAG} to ECR."
 
   - id: configure
     kind: configure
-    needs: [provision]
+    needs: [provision, build_push]
     timeout_minutes: 45
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -199,34 +262,24 @@ stages:
             --version 7.7.11 --namespace argocd --create-namespace \
             --values gitops/values/argocd-values.yaml \
             --wait --timeout 15m
-      - name: Seed the ECR repository URL into the GitOps values
+      - name: Point the GitOps values at the real ECR repository and image tag
         working-directory: infra
         run: |
           set -euo pipefail
           ECR_URL="$(terraform output -raw ecr_repository_url)"
           cd ..
-          python3 - "$ECR_URL" <<'PY'
-          import sys, pathlib
-          ecr = sys.argv[1]
+          TAG="${GITHUB_SHA::12}"
+          python3 - "$ECR_URL" "$TAG" <<'PY'
+          import sys, pathlib, re
+          ecr, tag = sys.argv[1], sys.argv[2]
           p = pathlib.Path("gitops/application-values.yaml")
           text = p.read_text()
           text = text.replace("PLACEHOLDER_ECR_REPOSITORY", ecr)
-          p.write_text(text)
-          print(f"gitops/application-values.yaml now points at {ecr}")
-          PY
-      - name: Pin the freshly built image tag in the GitOps values
-        run: |
-          set -euo pipefail
-          TAG="${GITHUB_SHA::12}"
-          python3 - "$TAG" <<'PY'
-          import sys, pathlib, re
-          tag = sys.argv[1]
-          p = pathlib.Path("gitops/application-values.yaml")
-          text = p.read_text()
           text = text.replace("PLACEHOLDER_IMAGE_TAG", tag)
+          text = re.sub(r'(?m)^(\s*repository:\s*).*$', lambda m: m.group(1) + ecr, text, count=1)
           text = re.sub(r'(?m)^(\s*tag:\s*).*$', lambda m: m.group(1) + tag, text, count=1)
           p.write_text(text)
-          print(f"gitops/application-values.yaml pinned to image tag {tag}")
+          print(f"gitops values -> {ecr}:{tag}")
           PY
       - name: Commit the GitOps values if they changed
         run: |
@@ -286,6 +339,15 @@ stages:
         run: aws eks update-kubeconfig --name "${{ steps.tf.outputs.cluster_name }}" --region us-east-1
       - name: Show cluster nodes
         run: kubectl get nodes -o wide
+      - name: Show platform components
+        run: |
+          set -euo pipefail
+          echo "--- argocd ---"
+          kubectl -n argocd get pods --no-headers || true
+          echo "--- argo-rollouts ---"
+          kubectl -n argo-rollouts get pods --no-headers || true
+          echo "--- monitoring ---"
+          kubectl -n monitoring get pods --no-headers || true
       - name: Wait for ArgoCD to sync the application
         timeout-minutes: 12
         run: |
@@ -324,7 +386,11 @@ stages:
               if curl --fail --silent --show-error --max-time 10 "http://${HOST}/actuator/health"; then
                 echo ""
                 echo "Application healthy at http://${HOST}"
-                echo "APPLICATION_URL=http://${HOST}" >> "$GITHUB_STEP_SUMMARY"
+                {
+                  echo "### Application is live"
+                  echo ""
+                  echo "http://${HOST}"
+                } >> "$GITHUB_STEP_SUMMARY"
                 exit 0
               fi
             fi
@@ -340,9 +406,9 @@ pipelines:
   # ---------------------------------------------------------------------
   # Continuous application delivery.
   #
-  # Runs on APPLICATION changes only. It never touches the cluster: it
-  # builds, scans, pushes to ECR and bumps the image tag in gitops/.
-  # ArgoCD does the deploying.
+  # Runs on APPLICATION changes only, once the infrastructure exists. It
+  # never touches the cluster: it builds, scans, pushes to ECR and bumps the
+  # image tag in gitops/. ArgoCD does the deploying.
   # ---------------------------------------------------------------------
   - id: app-delivery
     stages:
@@ -366,7 +432,12 @@ pipelines:
         needs: [app_test]
         timeout_minutes: 30
         env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: us-east-1
+          TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+          TF_VAR_region: us-east-1
+          TF_VAR_github_repo: ${{ github.repository }}
         steps:
           - name: Set up JDK 21
             uses: actions/setup-java@v4
@@ -374,6 +445,20 @@ pipelines:
               distribution: temurin
               java-version: "21"
               cache: maven
+          - name: Set up Terraform
+            uses: hashicorp/setup-terraform@v3
+            with:
+              terraform_version: 1.9.8
+          - name: Read the ECR repository URL from terraform state
+            id: tf
+            working-directory: infra
+            run: |
+              set -euo pipefail
+              terraform init -input=false -reconfigure \
+                -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+                -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+                -backend-config="region=us-east-1"
+              echo "ecr_url=$(terraform output -raw ecr_repository_url)" >> "$GITHUB_OUTPUT"
           - name: Package application
             working-directory: app
             run: mvn -B -ntp clean package -DskipTests
@@ -383,9 +468,6 @@ pipelines:
           - name: Build image
             working-directory: app
             run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
-          # Sole pre-push vulnerability gate: scans OS packages and the
-          # application JARs, failing the build on HIGH/CRITICAL before the
-          # image can reach ECR.
           - name: Scan image with Trivy
             uses: aquasecurity/trivy-action@0.28.0
             with:
@@ -404,12 +486,12 @@ pipelines:
             uses: aws-actions/amazon-ecr-login@v2
           - name: Push image to ECR
             env:
-              REGISTRY: ${{ steps.ecr.outputs.registry }}
+              ECR_URL: ${{ steps.tf.outputs.ecr_url }}
             run: |
               set -euo pipefail
               TAG="${{ steps.meta.outputs.image_tag }}"
-              docker tag "local/app:${TAG}" "${REGISTRY}/${{ secrets.PROJECT_NAME }}:${TAG}"
-              docker push "${REGISTRY}/${{ secrets.PROJECT_NAME }}:${TAG}"
+              docker tag "local/app:${TAG}" "${ECR_URL}:${TAG}"
+              docker push "${ECR_URL}:${TAG}"
           - name: Bump the image tag in the GitOps values
             run: |
               set -euo pipefail

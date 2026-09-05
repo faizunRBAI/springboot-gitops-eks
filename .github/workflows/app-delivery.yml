@@ -23,7 +23,12 @@ jobs:
     needs:
     - app_test
     env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_region: us-east-1
+      TF_VAR_github_repo: ${{ github.repository }}
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
@@ -33,6 +38,18 @@ jobs:
         distribution: temurin
         java-version: '21'
         cache: maven
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.9.8
+    - id: tf
+      name: Read the ECR repository URL from terraform state
+      run: "set -euo pipefail\nterraform init -input=false -reconfigure \\\n  -backend-config=\"\
+        bucket=${{ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"key=${{ secrets.PROJECT_NAME\
+        \ }}/terraform.tfstate\" \\\n  -backend-config=\"region=us-east-1\"\necho\
+        \ \"ecr_url=$(terraform output -raw ecr_repository_url)\" >> \"$GITHUB_OUTPUT\"\
+        \n"
+      working-directory: infra
     - name: Package application
       run: mvn -B -ntp clean package -DskipTests
       working-directory: app
@@ -63,13 +80,13 @@ jobs:
 
         TAG="${{ steps.meta.outputs.image_tag }}"
 
-        docker tag "local/app:${TAG}" "${REGISTRY}/${{ secrets.PROJECT_NAME }}:${TAG}"
+        docker tag "local/app:${TAG}" "${ECR_URL}:${TAG}"
 
-        docker push "${REGISTRY}/${{ secrets.PROJECT_NAME }}:${TAG}"
+        docker push "${ECR_URL}:${TAG}"
 
         '
       env:
-        REGISTRY: ${{ steps.ecr.outputs.registry }}
+        ECR_URL: ${{ steps.tf.outputs.ecr_url }}
     - name: Bump the image tag in the GitOps values
       run: "set -euo pipefail\nTAG=\"${{ steps.meta.outputs.image_tag }}\"\npython3\
         \ - \"$TAG\" <<'PY'\nimport sys, pathlib, re\ntag = sys.argv[1]\np = pathlib.Path(\"\
