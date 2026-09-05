@@ -119,6 +119,23 @@ jobs:
     - name: Build image
       run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
       working-directory: app
+    - name: Show accepted vulnerability exceptions
+      run: 'set -euo pipefail
+
+        echo "### Accepted vulnerability exceptions" >> "$GITHUB_STEP_SUMMARY"
+
+        echo ''```'' >> "$GITHUB_STEP_SUMMARY"
+
+        grep -v ''^\s*#'' app/.trivyignore | grep -v ''^\s*$'' >> "$GITHUB_STEP_SUMMARY"
+        || true
+
+        echo ''```'' >> "$GITHUB_STEP_SUMMARY"
+
+        echo "See app/.trivyignore for the justification and review date."
+
+        cat app/.trivyignore
+
+        '
     - name: Scan image with Trivy
       uses: aquasecurity/trivy-action@master
       with:
@@ -127,6 +144,7 @@ jobs:
         exit-code: '1'
         severity: HIGH,CRITICAL
         ignore-unfixed: 'true'
+        trivyignores: app/.trivyignore
     - name: Verify the OIDC role secret is present
       run: "set -euo pipefail\nif [ -z \"${CI_ROLE_ARN}\" ]; then\n  echo \"AWS_CI_ROLE_ARN\
         \ is not set.\"\n  echo \"\"\n  echo \"It is created by the provision stage\

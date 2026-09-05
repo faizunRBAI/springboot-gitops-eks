@@ -131,9 +131,25 @@ stages:
       - name: Build image
         working-directory: app
         run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
+      # Show what the accepted exceptions are, in the run log, every run.
+      # A suppression nobody sees is a suppression nobody reviews.
+      - name: Show accepted vulnerability exceptions
+        run: |
+          set -euo pipefail
+          echo "### Accepted vulnerability exceptions" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -v '^\s*#' app/.trivyignore | grep -v '^\s*$' >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "See app/.trivyignore for the justification and review date."
+          cat app/.trivyignore
       # Sole pre-push vulnerability gate. Scans OS packages AND the Spring Boot
       # JARs inside the image, so Java CVEs are caught at the deployed artifact.
       # exit-code 1: a HIGH/CRITICAL finding fails the build before any push.
+      #
+      # trivyignores points at app/.trivyignore explicitly: this step runs from
+      # the repository ROOT, so Trivy would not find a file living under app/.
+      # That file suppresses THREE named CVE IDs only; the severity threshold
+      # is untouched and every other HIGH/CRITICAL still fails the build.
       #
       # DO NOT ADD a `version:` input here. Pinning the scanner version makes
       # the action take an install path that writes the binary to
@@ -150,6 +166,7 @@ stages:
           exit-code: "1"
           severity: HIGH,CRITICAL
           ignore-unfixed: "true"
+          trivyignores: app/.trivyignore
       - name: Verify the OIDC role secret is present
         env:
           CI_ROLE_ARN: ${{ secrets.AWS_CI_ROLE_ARN }}
@@ -465,10 +482,9 @@ pipelines:
           - name: Build image
             working-directory: app
             run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
-          # Same contract as the deploy pipeline: @master, and NO `version:`
-          # input. Pinning the scanner version makes the installer write to a
-          # directory it never creates and exit 1 right after reporting
-          # "found version".
+          # Same contract as the deploy pipeline: @master, NO `version:` input,
+          # and trivyignores pointed at app/.trivyignore because this step runs
+          # from the repository root.
           - name: Scan image with Trivy
             uses: aquasecurity/trivy-action@master
             with:
@@ -477,6 +493,7 @@ pipelines:
               exit-code: "1"
               severity: HIGH,CRITICAL
               ignore-unfixed: "true"
+              trivyignores: app/.trivyignore
           - name: Authenticate to AWS via OIDC
             uses: aws-actions/configure-aws-credentials@v4
             with:

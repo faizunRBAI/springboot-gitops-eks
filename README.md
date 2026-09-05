@@ -78,11 +78,12 @@ controller — two controllers, one field, flapping forever.
 ## Repository layout
 
 ```
-app/                     Spring Boot 3.4 application (Java 21, Maven)
+app/                     Spring Boot 3.5 application (Java 21, Maven)
   src/main/java/...      Application + InfoController
   src/main/resources/    application.properties, static landing page
   src/test/java/...      JUnit tests (7, including a Prometheus endpoint test)
   Dockerfile             Multi-stage, non-root, layered JAR
+  .trivyignore           Accepted vulnerability exceptions (dated, justified)
 chart/                   Helm chart
   templates/rollout.yaml         Argo Rollouts Rollout (blue/green + canary)
   templates/analysistemplate.yaml Prometheus-backed canary analysis
@@ -201,6 +202,45 @@ front, not a default.
   capabilities dropped, `RuntimeDefault` seccomp.
 - **Private nodes.** Workers have no public IPs; egress goes through the NAT.
 
+### Accepted vulnerability exceptions — REVIEW BY 2026-10-05
+
+Three CVEs are suppressed in [`app/.trivyignore`](app/.trivyignore). This is a
+**risk acceptance**, not a fix, and it is documented here so it gets reviewed
+rather than forgotten.
+
+| CVE | Severity | Issue |
+|---|---|---|
+| CVE-2026-65182 | **CRITICAL** | Tomcat security-constraint bypass |
+| CVE-2026-65905 | HIGH | Tomcat DIGEST authentication replay bypass |
+| CVE-2026-68525 | HIGH | Tomcat FORM authentication bypass |
+
+**Why they are not fixed:** all three require Tomcat **10.1.58**. No released
+Spring Boot version ships it — 3.5.16 (the newest stable) manages 10.1.55. The
+project already moved 3.4.1 → 3.5.16 to close the *earlier* Tomcat advisories,
+which it did; these were disclosed against the newer version. This is an
+upstream release-timing gap.
+
+**Why the practical exposure is limited:** all three bypass Tomcat's *own*
+authentication and security-constraint machinery. This application defines no
+security constraints, uses no DIGEST or FORM authentication, has no Spring
+Security dependency, and serves only public endpoints (`/`, `/api/info`,
+`/actuator/health`, `/actuator/prometheus`). There is no auth layer to bypass.
+
+**This acceptance becomes invalid immediately if** Spring Security or any
+authentication is added, any endpoint becomes access-controlled, or a
+security-constraint / DIGEST / FORM login config is introduced. In those cases
+remove the entries and upgrade Tomcat *first*.
+
+**To retire it:** bump the Spring Boot parent once a release manages Tomcat
+≥ 10.1.58, or set `<tomcat.version>10.1.58</tomcat.version>` in `app/pom.xml`
+once that release is on Maven Central, then delete the entries. Enabling
+GitHub Dependabot (free on public repositories) surfaces those bumps
+automatically instead of via a failed deploy.
+
+The severity threshold is **untouched** — every other HIGH/CRITICAL finding
+still fails the build. Only these three IDs are suppressed, and the build
+prints them in the job summary on every run.
+
 ### Known gaps (deliberate, not oversights)
 
 - **No source-level dependency scanner.** OWASP dependency-check was removed:
@@ -245,9 +285,10 @@ and all configuration survive, so redeploying later is a single action.
 
 1. **Provision** — Terraform builds the VPC, EKS, ECR, and the OIDC role.
 2. Set `AWS_CI_ROLE_ARN` from `terraform output -raw ci_role_arn`.
-3. **Configure** — installs the Load Balancer Controller, Argo Rollouts,
+3. **Build and push** — image built, Trivy-scanned, pushed to ECR.
+4. **Configure** — installs the Load Balancer Controller, Argo Rollouts,
    kube-prometheus-stack and ArgoCD, then applies the root Application.
-4. **Verify** — waits for ArgoCD to report Synced/Healthy, then probes the ALB.
+5. **Verify** — waits for ArgoCD to report Synced/Healthy, then probes the ALB.
 
 Afterwards, every `app/**` commit runs the `app-delivery` workflow only.
 

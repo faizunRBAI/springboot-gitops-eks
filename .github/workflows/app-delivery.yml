@@ -67,6 +67,7 @@ jobs:
         exit-code: '1'
         severity: HIGH,CRITICAL
         ignore-unfixed: 'true'
+        trivyignores: app/.trivyignore
     - name: Authenticate to AWS via OIDC
       uses: aws-actions/configure-aws-credentials@v4
       with:
