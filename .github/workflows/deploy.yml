@@ -156,6 +156,15 @@ jobs:
         '
       env:
         ECR_URL: ${{ steps.tf.outputs.ecr_url }}
+    - name: Record the image reference for the GitOps values
+      run: "set -euo pipefail\nTAG=\"${{ steps.meta.outputs.image_tag }}\"\n{\n  echo\
+        \ \"### Image published\"\n  echo \"\"\n  echo \"If gitops/application-values.yaml\
+        \ does not already point at\"\n  echo \"this tag, update it and commit through\
+        \ the platform:\"\n  echo \"\"\n  echo '```yaml'\n  echo \"image:\"\n  echo\
+        \ \"  repository: ${ECR_URL}\"\n  echo \"  tag: ${TAG}\"\n  echo '```'\n}\
+        \ >> \"$GITHUB_STEP_SUMMARY\"\n"
+      env:
+        ECR_URL: ${{ steps.tf.outputs.ecr_url }}
   configure:
     runs-on: ubuntu-latest
     needs:
@@ -260,71 +269,33 @@ jobs:
       with:
         version: v1.33.0
     - id: tf
-      name: Read infrastructure outputs from terraform state
+      name: Read the cluster name from terraform state
       run: "set -euo pipefail\nterraform init -input=false -reconfigure \\\n  -backend-config=\"\
         bucket=${{ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"key=${{ secrets.PROJECT_NAME\
         \ }}/terraform.tfstate\" \\\n  -backend-config=\"region=us-east-1\"\necho\
         \ \"cluster_name=$(terraform output -raw cluster_name)\" >> \"$GITHUB_OUTPUT\"\
-        \necho \"ecr_url=$(terraform output -raw ecr_repository_url)\" >> \"$GITHUB_OUTPUT\"\
         \n"
       working-directory: infra
     - name: Update kubeconfig
       run: aws eks update-kubeconfig --name "${{ steps.tf.outputs.cluster_name }}"
         --region us-east-1
-    - name: Point the GitOps values at the real ECR repository and image tag
-      run: 'set -euo pipefail
-
-        TAG="${GITHUB_SHA::12}"
-
-        python3 - "$ECR_URL" "$TAG" <<''PY''
-
-        import sys, pathlib, re
-
-        ecr, tag = sys.argv[1], sys.argv[2]
-
-        p = pathlib.Path("gitops/application-values.yaml")
-
-        text = p.read_text()
-
-        text = text.replace("PLACEHOLDER_ECR_REPOSITORY", ecr)
-
-        text = text.replace("PLACEHOLDER_IMAGE_TAG", tag)
-
-        text = re.sub(r''(?m)^(\s*repository:\s*).*$'', lambda m: m.group(1) + ecr,
-        text, count=1)
-
-        text = re.sub(r''(?m)^(\s*tag:\s*).*$'', lambda m: m.group(1) + tag, text,
-        count=1)
-
-        p.write_text(text)
-
-        print(f"gitops/application-values.yaml -> {ecr}:{tag}")
-
-        PY
-
-        '
-      env:
-        ECR_URL: ${{ steps.tf.outputs.ecr_url }}
-    - name: Commit the GitOps values if they changed
-      run: "set -euo pipefail\ngit config user.name \"github-actions[bot]\"\ngit config\
-        \ user.email \"github-actions[bot]@users.noreply.github.com\"\nif git diff\
-        \ --quiet -- gitops/application-values.yaml; then\n  echo \"GitOps values\
-        \ already current; nothing to commit.\"\nelse\n  git add gitops/application-values.yaml\n\
-        \  # [skip ci] is loop-prevention layer 1: this commit must never\n  # start\
-        \ another delivery run.\n  git commit -m \"chore(gitops): pin image tag ${GITHUB_SHA::12}\
-        \ [skip ci]\"\n  git push origin HEAD:main\n  echo \"Pushed. ArgoCD will reconcile\
-        \ this commit onto the cluster.\"\nfi\n"
+    - name: Verify the GitOps values are real
+      run: "set -euo pipefail\necho \"--- gitops/application-values.yaml (image block)\
+        \ ---\"\nsed -n '/^image:/,/^replicaCount/p' gitops/application-values.yaml\n\
+        if grep -q 'PLACEHOLDER' gitops/application-values.yaml; then\n  echo \"\"\
+        \n  echo \"ERROR: gitops/application-values.yaml still contains a PLACEHOLDER.\"\
+        \n  echo \"ArgoCD cannot render the chart from placeholder values.\"\n  echo\
+        \ \"Update image.repository and image.tag in that file, commit it,\"\n  echo\
+        \ \"and run the deploy again. The build_push job summary prints the\"\n  echo\
+        \ \"exact values to use.\"\n  exit 1\nfi\necho \"GitOps values are concrete.\"\
+        \n"
     - name: Apply the ArgoCD root application
       run: "set -euo pipefail\nsed \"s|__REPO_URL__|https://github.com/${{ github.repository\
         \ }}.git|g\" \\\n  gitops/root-app.yaml | kubectl apply -f -\n"
     - name: Confirm the application exists
-      run: 'kubectl -n argocd get applications || true
-
-        echo "### GitOps handoff complete" >> "$GITHUB_STEP_SUMMARY"
-
-        echo "ArgoCD now owns the application. CI does not deploy." >> "$GITHUB_STEP_SUMMARY"
-
-        '
+      run: "kubectl -n argocd get applications || true\n{\n  echo \"### GitOps handoff\
+        \ complete\"\n  echo \"\"\n  echo \"ArgoCD now owns the application. CI does\
+        \ not deploy.\"\n} >> \"$GITHUB_STEP_SUMMARY\"\n"
   verify:
     runs-on: ubuntu-latest
     needs:

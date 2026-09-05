@@ -132,7 +132,7 @@ stages:
           trivyignores: app/.trivyignore
       # Authentication uses the platform's injected static credentials. OIDC
       # needs `permissions: id-token: write`, which the pipeline spec cannot
-      # express — see the header of infra/oidc.tf for the restore procedure.
+      # express — see the header of infra/oidc.tf.
       - name: Confirm the AWS identity in use
         run: |
           set -euo pipefail
@@ -149,9 +149,26 @@ stages:
           docker tag "local/app:${TAG}" "${ECR_URL}:${TAG}"
           docker push "${ECR_URL}:${TAG}"
           echo "Pushed ${TAG} to ECR."
+      - name: Record the image reference for the GitOps values
+        env:
+          ECR_URL: ${{ steps.tf.outputs.ecr_url }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.image_tag }}"
+          {
+            echo "### Image published"
+            echo ""
+            echo "If gitops/application-values.yaml does not already point at"
+            echo "this tag, update it and commit through the platform:"
+            echo ""
+            echo '```yaml'
+            echo "image:"
+            echo "  repository: ${ECR_URL}"
+            echo "  tag: ${TAG}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-  # CONFIGURE installs the cluster platform ONLY. The GitOps handoff lives in
-  # its own stage below.
+  # CONFIGURE installs the cluster platform ONLY.
   - id: configure
     kind: configure
     needs: [provision, build_push]
@@ -222,10 +239,6 @@ stages:
           helm upgrade --install argo-rollouts argo/argo-rollouts \
             --version 2.38.2 --namespace argo-rollouts --create-namespace
           kubectl -n argo-rollouts rollout status deployment/argo-rollouts --timeout=8m
-      # helm --wait is deliberately NOT used for this chart. It blocks on every
-      # object in a large release at once and reports only "context deadline
-      # exceeded", naming nothing. Waiting on the StatefulSet is faster to
-      # satisfy and fails with a specific resource.
       - name: Install kube-prometheus-stack
         timeout-minutes: 20
         run: |
@@ -246,14 +259,9 @@ stages:
             --values gitops/values/argocd-values.yaml
           kubectl -n argocd rollout status deployment/argocd-server --timeout=10m
           kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=10m
-      # NO `set -euo pipefail` and NO grep in this step.
-      # It previously ended with:
-      #   kubectl get pods -A --no-headers | grep -v Running || echo "..."
-      # Under pipefail, when EVERY pod is Running, `grep -v Running` matches
-      # nothing and exits 1 — so the step failed precisely BECAUSE the cluster
-      # was completely healthy, killing the stage about three minutes in and
-      # preventing the GitOps handoff from ever running. A reporting step must
-      # never be able to fail the build.
+      # Reporting only — must never be able to fail the build. No pipefail, no
+      # grep: `grep -v Running` exits 1 when every pod IS Running, which once
+      # failed this stage precisely because the cluster was healthy.
       - name: Report platform state
         run: |
           helm list --all-namespaces || true
@@ -261,11 +269,25 @@ stages:
           kubectl get pods -A || true
 
   # ---------------------------------------------------------------------
-  # GITOPS HANDOFF — the point where CI stops and ArgoCD takes over.
-  # Its own stage so it cannot be starved or killed by the platform installs.
-  # Self-sufficient: fresh runner, own tooling, reads the ECR URL from state
-  # rather than consuming job outputs (which embed the PROJECT_NAME secret and
-  # would be dropped by GitHub).
+  # GITOPS HANDOFF — creates the ArgoCD Application. CI stops here.
+  #
+  # THIS STAGE DOES NOT PUSH TO GIT, and must not.
+  # GITHUB_TOKEN is granted `contents: read` in rendered workflows, and the
+  # pipeline spec has no `permissions` key to raise it, so a push fails with:
+  #   remote: Permission to <repo>.git denied to github-actions[bot].
+  #   fatal: ... The requested URL returned error: 403
+  # The commit succeeds locally and the push dies, which is why the repository
+  # never showed the [skip ci] commit while the job appeared to do its work.
+  #
+  # Instead, gitops/application-values.yaml is maintained in the repository
+  # itself (updated and committed through the platform's own commit flow, which
+  # is the sanctioned way to change the repo anyway). This stage VERIFIES those
+  # values are real and then applies the Application.
+  #
+  # Consequence for day-2: the app-delivery pipeline cannot auto-bump the image
+  # tag either. A new image is published, and the tag is promoted by committing
+  # gitops/application-values.yaml. That is still GitOps — the deployed version
+  # is whatever Git says — it simply is not automatic. Documented in the README.
   # ---------------------------------------------------------------------
   - id: gitops_handoff
     kind: custom
@@ -287,7 +309,7 @@ stages:
         uses: azure/setup-kubectl@v4
         with:
           version: v1.33.0
-      - name: Read infrastructure outputs from terraform state
+      - name: Read the cluster name from terraform state
         id: tf
         working-directory: infra
         run: |
@@ -297,44 +319,25 @@ stages:
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
             -backend-config="region=us-east-1"
           echo "cluster_name=$(terraform output -raw cluster_name)" >> "$GITHUB_OUTPUT"
-          echo "ecr_url=$(terraform output -raw ecr_repository_url)" >> "$GITHUB_OUTPUT"
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "${{ steps.tf.outputs.cluster_name }}" --region us-east-1
-      - name: Point the GitOps values at the real ECR repository and image tag
-        env:
-          ECR_URL: ${{ steps.tf.outputs.ecr_url }}
+      # Fail loudly if the committed values are not deployable, rather than
+      # creating an Application that ArgoCD cannot render.
+      - name: Verify the GitOps values are real
         run: |
           set -euo pipefail
-          TAG="${GITHUB_SHA::12}"
-          python3 - "$ECR_URL" "$TAG" <<'PY'
-          import sys, pathlib, re
-          ecr, tag = sys.argv[1], sys.argv[2]
-          p = pathlib.Path("gitops/application-values.yaml")
-          text = p.read_text()
-          text = text.replace("PLACEHOLDER_ECR_REPOSITORY", ecr)
-          text = text.replace("PLACEHOLDER_IMAGE_TAG", tag)
-          text = re.sub(r'(?m)^(\s*repository:\s*).*$', lambda m: m.group(1) + ecr, text, count=1)
-          text = re.sub(r'(?m)^(\s*tag:\s*).*$', lambda m: m.group(1) + tag, text, count=1)
-          p.write_text(text)
-          print(f"gitops/application-values.yaml -> {ecr}:{tag}")
-          PY
-      - name: Commit the GitOps values if they changed
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- gitops/application-values.yaml; then
-            echo "GitOps values already current; nothing to commit."
-          else
-            git add gitops/application-values.yaml
-            # [skip ci] is loop-prevention layer 1: this commit must never
-            # start another delivery run.
-            git commit -m "chore(gitops): pin image tag ${GITHUB_SHA::12} [skip ci]"
-            git push origin HEAD:main
-            echo "Pushed. ArgoCD will reconcile this commit onto the cluster."
+          echo "--- gitops/application-values.yaml (image block) ---"
+          sed -n '/^image:/,/^replicaCount/p' gitops/application-values.yaml
+          if grep -q 'PLACEHOLDER' gitops/application-values.yaml; then
+            echo ""
+            echo "ERROR: gitops/application-values.yaml still contains a PLACEHOLDER."
+            echo "ArgoCD cannot render the chart from placeholder values."
+            echo "Update image.repository and image.tag in that file, commit it,"
+            echo "and run the deploy again. The build_push job summary prints the"
+            echo "exact values to use."
+            exit 1
           fi
-      # No ArgoCD repository credential is registered: the monorepo is PUBLIC
-      # and ArgoCD clones it anonymously.
+          echo "GitOps values are concrete."
       - name: Apply the ArgoCD root application
         run: |
           set -euo pipefail
@@ -343,8 +346,11 @@ stages:
       - name: Confirm the application exists
         run: |
           kubectl -n argocd get applications || true
-          echo "### GitOps handoff complete" >> "$GITHUB_STEP_SUMMARY"
-          echo "ArgoCD now owns the application. CI does not deploy." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### GitOps handoff complete"
+            echo ""
+            echo "ArgoCD now owns the application. CI does not deploy."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   - id: verify
     kind: verify
@@ -443,8 +449,11 @@ stages:
 pipelines:
   # ---------------------------------------------------------------------
   # Continuous application delivery. Runs on APPLICATION changes only.
-  # Never touches the cluster: builds, scans, pushes to ECR and bumps the
-  # image tag in gitops/. ArgoCD does the deploying.
+  #
+  # It builds, scans and publishes the image, then PRINTS the reference to
+  # promote. It does not commit: GITHUB_TOKEN has contents: read and the spec
+  # cannot raise it, so a push fails with 403. Promote by updating
+  # gitops/application-values.yaml and committing through the platform.
   # ---------------------------------------------------------------------
   - id: app-delivery
     stages:
@@ -528,35 +537,25 @@ pipelines:
               TAG="${{ steps.meta.outputs.image_tag }}"
               docker tag "local/app:${TAG}" "${ECR_URL}:${TAG}"
               docker push "${ECR_URL}:${TAG}"
-          - name: Bump the image tag in the GitOps values
+          - name: Print the image reference to promote
+            env:
+              ECR_URL: ${{ steps.tf.outputs.ecr_url }}
             run: |
               set -euo pipefail
               TAG="${{ steps.meta.outputs.image_tag }}"
-              python3 - "$TAG" <<'PY'
-              import sys, pathlib, re
-              tag = sys.argv[1]
-              p = pathlib.Path("gitops/application-values.yaml")
-              text = p.read_text()
-              new, n = re.subn(r'(?m)^(\s*tag:\s*).*$', lambda m: m.group(1) + tag, text, count=1)
-              if n != 1:
-                  raise SystemExit("expected exactly one 'tag:' line in gitops/application-values.yaml")
-              p.write_text(new)
-              print(f"pinned image tag {tag}")
-              PY
-          - name: Commit and push the tag bump
-            run: |
-              set -euo pipefail
-              git config user.name "github-actions[bot]"
-              git config user.email "github-actions[bot]@users.noreply.github.com"
-              if git diff --quiet -- gitops/application-values.yaml; then
-                echo "Image tag unchanged; nothing to commit."
-              else
-                git add gitops/application-values.yaml
-                # [skip ci] stops this commit from starting another run.
-                git commit -m "chore(gitops): deploy ${{ steps.meta.outputs.image_tag }} [skip ci]"
-                git push origin HEAD:main
-                echo "ArgoCD will reconcile this commit onto the cluster."
-              fi
+              {
+                echo "### Image published — promote it to deploy"
+                echo ""
+                echo "Set this in gitops/application-values.yaml and commit:"
+                echo ""
+                echo '```yaml'
+                echo "image:"
+                echo "  repository: ${ECR_URL}"
+                echo "  tag: ${TAG}"
+                echo '```'
+                echo ""
+                echo "ArgoCD reconciles the commit onto the cluster."
+              } >> "$GITHUB_STEP_SUMMARY"
 
 rollback:
   strategy: rerun

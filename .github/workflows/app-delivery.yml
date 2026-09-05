@@ -89,19 +89,12 @@ jobs:
         '
       env:
         ECR_URL: ${{ steps.tf.outputs.ecr_url }}
-    - name: Bump the image tag in the GitOps values
-      run: "set -euo pipefail\nTAG=\"${{ steps.meta.outputs.image_tag }}\"\npython3\
-        \ - \"$TAG\" <<'PY'\nimport sys, pathlib, re\ntag = sys.argv[1]\np = pathlib.Path(\"\
-        gitops/application-values.yaml\")\ntext = p.read_text()\nnew, n = re.subn(r'(?m)^(\\\
-        s*tag:\\s*).*$', lambda m: m.group(1) + tag, text, count=1)\nif n != 1:\n\
-        \    raise SystemExit(\"expected exactly one 'tag:' line in gitops/application-values.yaml\"\
-        )\np.write_text(new)\nprint(f\"pinned image tag {tag}\")\nPY\n"
-    - name: Commit and push the tag bump
-      run: "set -euo pipefail\ngit config user.name \"github-actions[bot]\"\ngit config\
-        \ user.email \"github-actions[bot]@users.noreply.github.com\"\nif git diff\
-        \ --quiet -- gitops/application-values.yaml; then\n  echo \"Image tag unchanged;\
-        \ nothing to commit.\"\nelse\n  git add gitops/application-values.yaml\n \
-        \ # [skip ci] stops this commit from starting another run.\n  git commit -m\
-        \ \"chore(gitops): deploy ${{ steps.meta.outputs.image_tag }} [skip ci]\"\n\
-        \  git push origin HEAD:main\n  echo \"ArgoCD will reconcile this commit onto\
-        \ the cluster.\"\nfi\n"
+    - name: Print the image reference to promote
+      run: "set -euo pipefail\nTAG=\"${{ steps.meta.outputs.image_tag }}\"\n{\n  echo\
+        \ \"### Image published \u2014 promote it to deploy\"\n  echo \"\"\n  echo\
+        \ \"Set this in gitops/application-values.yaml and commit:\"\n  echo \"\"\n\
+        \  echo '```yaml'\n  echo \"image:\"\n  echo \"  repository: ${ECR_URL}\"\n\
+        \  echo \"  tag: ${TAG}\"\n  echo '```'\n  echo \"\"\n  echo \"ArgoCD reconciles\
+        \ the commit onto the cluster.\"\n} >> \"$GITHUB_STEP_SUMMARY\"\n"
+      env:
+        ECR_URL: ${{ steps.tf.outputs.ecr_url }}

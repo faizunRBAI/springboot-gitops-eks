@@ -13,14 +13,16 @@ Developer
    ▼
 GitHub monorepo ──────────────────────────────────────────┐
    │                                                      │
-   │ (app/** changes)                                     │ (gitops/** changes)
+   │ (app/** changes)                                     │
    ▼                                                      │
 GitHub Actions ───────────▶ AWS                           │
    │  test · build · Trivy image scan                     │
    │                                                      │
    ├──▶ push image ──▶ ECR (scan on push)                 │
    │                                                      │
-   └──▶ commit new image tag to gitops/ [skip ci] ────────┘
+   └──▶ prints the image reference to promote             │
+                                                          │
+Developer commits the new tag to gitops/ ─────────────────┘
                                                           │
                                                           ▼
                                                     ArgoCD (in cluster)
@@ -48,30 +50,58 @@ The canonical diagram is [`.udap/architecture.d2`](.udap/architecture.d2).
 
 This is the most important design property of the repository.
 
-| | CI loop (push) | GitOps loop (pull) |
+| | CI loop | GitOps loop (pull) |
 |---|---|---|
 | Actor | GitHub Actions | ArgoCD |
 | Trigger | commit under `app/**` | commit under `gitops/**` or `chart/**` |
-| Writes to | **Git only** | **cluster only** |
+| Writes to | **ECR only** | **cluster only** |
 | Never does | `kubectl apply`, `helm upgrade` on the app | write to Git |
 
-CI builds an image and records *what should run* by changing one line in
-`gitops/application-values.yaml`. ArgoCD notices and makes the cluster match.
+CI builds and publishes an image. `gitops/application-values.yaml` records
+*what should run*. ArgoCD notices and makes the cluster match.
 
-**Three independent loop-prevention layers:**
+**Loop prevention:**
 
-1. CI's tag-bump commit contains `[skip ci]`.
+1. CI cannot write to Git at all (see below), so it cannot trigger itself.
 2. The delivery workflow ignores changes under `gitops/**`.
 3. CI holds **no cluster credentials for application deployment** — it is
    structurally incapable of deploying, so it cannot race ArgoCD.
-
-Any one layer can be defeated by a future edit. All three together cannot.
-Do not remove one because the other two look sufficient.
 
 There is a fourth, subtler guard: ArgoCD `ignoreDifferences` on
 `/spec/replicas` of the Rollout. Argo Rollouts changes replica counts during a
 rollout; without this, ArgoCD would see drift and fight the rollouts
 controller — two controllers, one field, flapping forever.
+
+### Promoting a new image (the one manual step)
+
+CI publishes the image and prints the reference in its job summary. To deploy
+it, set the tag in [`gitops/application-values.yaml`](gitops/application-values.yaml)
+and commit:
+
+```yaml
+image:
+  repository: 241533126054.dkr.ecr.us-east-1.amazonaws.com/springboot-gitops-eks
+  tag: <the tag printed by the app-delivery run>
+```
+
+ArgoCD reconciles the commit onto the cluster within minutes.
+
+**Why this is not automatic.** Rendered workflows receive
+`GITHUB_TOKEN` with `contents: read`, and the platform's pipeline spec has no
+`permissions` key to raise it. A CI-side `git push` therefore fails:
+
+```
+remote: Permission to <owner>/<repo>.git denied to github-actions[bot].
+fatal: ... The requested URL returned error: 403
+```
+
+The commit succeeds locally and only the push is denied, which makes this
+failure look like something else entirely — worth knowing if you see it.
+
+This remains GitOps: Git is still the single source of truth and ArgoCD is
+still the only writer to the cluster. The tag bump is a deliberate commit
+rather than an automated one. Restoring automation needs
+`permissions: contents: write`, which requires platform support.
 
 ---
 
@@ -92,12 +122,13 @@ chart/                   Helm chart
   templates/servicemonitor.yaml  Prometheus scrape config
 gitops/                  ArgoCD configuration
   root-app.yaml                  ArgoCD Application (app-of-apps entry point)
-  application-values.yaml        THE CI→GitOps handoff (image tag lives here)
+  application-values.yaml        THE HANDOFF (image tag lives here)
   values/argocd-values.yaml      ArgoCD install values
   values/monitoring-values.yaml  kube-prometheus-stack values
 infra/                   Terraform (AWS)
   network.tf             VPC, 3 AZs, single NAT gateway
   eks.tf                 EKS 1.33 control plane, node group, addons, IRSA
+  ebs-csi.tf             EBS CSI driver + default gp3 StorageClass
   ecr.tf                 ECR repository + lifecycle policy
   oidc.tf                GitHub OIDC provider + scoped role (provisioned,
                          not currently used — see Security posture)
@@ -149,7 +180,7 @@ The old ReplicaSet stays for 300s after promotion, so rollback is instant.
 |---|---|---|
 | 1 | **Automatic abort** — Argo Rollouts reverts on failed analysis | Bad version caught by metrics |
 | 2 | `kubectl argo rollouts undo springboot-app -n springboot-app` | Manual revert of the current rollout |
-| 3 | Revert the tag in `gitops/application-values.yaml` and push | Git-auditable rollback; ArgoCD reconciles |
+| 3 | Revert the tag in `gitops/application-values.yaml` and commit | Git-auditable rollback; ArgoCD reconciles |
 | 4 | Platform **Rollback to stable** | Reverts the repo to the last green deploy and redeploys |
 
 Level 3 is the GitOps-correct one: the cluster state is whatever Git says, so
@@ -194,13 +225,16 @@ front, not a default.
   including the Spring Boot JARs — so Java CVEs are covered. **ECR scan-on-push**
   re-scans stored images to catch CVEs disclosed after the build.
 - **Least-privilege IAM for in-cluster workloads.** The Load Balancer
-  Controller uses IRSA bound to one service account, not node-level
-  credentials.
+  Controller and the EBS CSI driver each use IRSA bound to one service
+  account, not node-level credentials.
 - **Hardened pods.** Non-root (uid 10001), read-only root filesystem, all
   capabilities dropped, `RuntimeDefault` seccomp.
 - **Private nodes.** Workers have no public IPs; egress goes through the NAT.
 - **No secrets in Git.** All credentials are repository secrets referenced as
   `${{ secrets.NAME }}`; none are committed.
+- **CI cannot write to the repository**, which removes an entire class of
+  supply-chain risk — though here it is a platform constraint rather than a
+  deliberate choice (see above).
 
 ### CI authentication: static keys, not OIDC — and why
 
@@ -228,12 +262,15 @@ Did you mean to set the `id-token` permission?
 Credentials could not be loaded: Could not load credentials from any providers
 ```
 
-**What this does and does not cost.** The static credentials were already
-present in the job's environment because the Terraform steps read remote state
-with them, so using them for the ECR push adds no credential that was not
-already there. What is lost is the *short-lived, repo-scoped* property of OIDC:
-the delivery job now holds long-lived account credentials rather than a
-15-minute token scoped to one ECR repository.
+The same missing field blocks `contents: write`, which is why CI cannot commit
+the image tag. **One absent capability, two consequences.**
+
+**What this costs.** The static credentials were already in the job's
+environment because the Terraform steps read remote state with them, so using
+them for the ECR push adds no credential that was not already there. What is
+lost is the *short-lived, repo-scoped* property of OIDC: the delivery job holds
+long-lived account credentials rather than a 15-minute token scoped to one ECR
+repository.
 
 **To restore OIDC** once the platform supports job permissions: add
 `permissions: { id-token: write, contents: read }` to the `build_push` and
@@ -284,7 +321,8 @@ prints them in the job summary on every run.
 
 ### Known gaps (deliberate, not oversights)
 
-- **CI uses long-lived AWS credentials** — see the section above.
+- **CI uses long-lived AWS credentials** — see above.
+- **Image promotion is a manual commit** — see above.
 - **No source-level dependency scanner.** OWASP dependency-check was removed:
   without an NVD API key it ran 10–40 minutes and exceeded the stage timeout.
   Trivy's image scan covers the same Java CVEs at the deployed artifact. To
@@ -325,13 +363,16 @@ and all configuration survive, so redeploying later is a single action.
 
 ## Deployment order
 
-1. **Provision** — Terraform builds the VPC, EKS, ECR and IAM.
+1. **Provision** — Terraform builds the VPC, EKS, ECR, EBS CSI and IAM.
 2. **Build and push** — image built, Trivy-scanned, pushed to ECR.
 3. **Configure** — installs the Load Balancer Controller, Argo Rollouts,
-   kube-prometheus-stack and ArgoCD, then applies the root Application.
-4. **Verify** — waits for ArgoCD to report Synced/Healthy, then probes the ALB.
+   kube-prometheus-stack and ArgoCD.
+4. **GitOps handoff** — verifies the committed values are concrete and applies
+   the ArgoCD root Application.
+5. **Verify** — waits for ArgoCD to report Synced/Healthy, then probes the ALB.
 
-Afterwards, every `app/**` commit runs the `app-delivery` workflow only.
+Afterwards, every `app/**` commit runs the `app-delivery` workflow, which
+publishes a new image and prints the tag to promote.
 
 ## Required repository secrets
 
