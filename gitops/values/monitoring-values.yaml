@@ -40,11 +40,62 @@ prometheus:
             requests:
               storage: 10Gi
 
+  # Prometheus itself stays INTERNAL. Its query API is unauthenticated — any
+  # caller can read every metric in the cluster and use the admin API. Grafana
+  # reaches it in-cluster, which is all that is needed. Reach it directly with:
+  #   kubectl -n monitoring port-forward svc/monitoring-kube-prometheus-prometheus 9090:9090
+  service:
+    type: ClusterIP
+
 grafana:
   # adminPassword is injected by the configure stage via --set from a
   # repository secret. Never commit a value here.
+
+  # ---------------------------------------------------------------------
+  # INTERNET-EXPOSED — DELIBERATE, FOR A TEST/DEMO ENVIRONMENT.
+  #
+  # The user asked for a shareable dashboard URL rather than port-forwarding.
+  # This publishes Grafana on an internet-facing ALB over PLAIN HTTP.
+  #
+  # WHAT THAT MEANS, stated plainly:
+  #   * the login page is reachable by anyone who finds the hostname, and
+  #     ALB hostnames are continuously scanned
+  #   * there is no TLS, so the admin password crosses the internet in
+  #     cleartext and is readable by anyone on the path
+  #   * Grafana admin can edit dashboards, add data sources and read every
+  #     metric in the cluster
+  #
+  # It is exposed anyway because this is a non-production demo environment
+  # with no real data, and the value of showing it outweighs that risk HERE.
+  #
+  # BEFORE THIS IS EVER PRODUCTION:
+  #   1. add TLS (cert-manager + ACM/Route53) and redirect 80 -> 443
+  #   2. put SSO in front (Grafana supports OAuth/OIDC) or restrict the ALB
+  #      to known source IPs with alb.ingress.kubernetes.io/inbound-cidrs
+  #   3. rotate GRAFANA_ADMIN_PASSWORD, since it has travelled unencrypted
+  #
+  # ArgoCD is deliberately NOT exposed the same way: its admin account can
+  # deploy and delete anything in the cluster, which is a materially larger
+  # blast radius than a metrics dashboard. It stays on port-forward.
+  # ---------------------------------------------------------------------
   service:
     type: ClusterIP
+
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+      alb.ingress.kubernetes.io/healthcheck-path: /api/health
+      # A separate ALB from the application's. Sharing one via group.name
+      # would couple the demo dashboard's availability to the app's ingress.
+      alb.ingress.kubernetes.io/group.name: monitoring
+    # No host rule: match any hostname so the raw ALB DNS name works without
+    # a domain. Add the real host here once DNS and TLS exist.
+    path: /
+    pathType: Prefix
 
   # Grafana's own dashboards and settings are disposable — they are declared
   # in this file, so an ephemeral volume loses nothing that is not recreated
@@ -52,6 +103,15 @@ grafana:
   # history is what canary analysis reads.
   persistence:
     enabled: false
+
+  # Anonymous viewing is OFF. Even in a demo, an unauthenticated dashboard on
+  # the public internet leaks cluster topology, namespaces, workload names and
+  # traffic patterns — useful reconnaissance. Viewers log in.
+  grafana.ini:
+    auth.anonymous:
+      enabled: false
+    users:
+      allow_sign_up: false
 
   resources:
     requests:
