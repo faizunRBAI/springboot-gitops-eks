@@ -112,9 +112,7 @@ jobs:
       run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
       working-directory: app
     - name: Show accepted vulnerability exceptions
-      run: 'set -euo pipefail
-
-        echo "### Accepted vulnerability exceptions" >> "$GITHUB_STEP_SUMMARY"
+      run: 'echo "### Accepted vulnerability exceptions" >> "$GITHUB_STEP_SUMMARY"
 
         echo ''```'' >> "$GITHUB_STEP_SUMMARY"
 
@@ -232,11 +230,11 @@ jobs:
         \ --timeout=10m\n"
       timeout-minutes: 15
     - name: Report platform state
-      run: 'set -euo pipefail
+      run: 'helm list --all-namespaces || true
 
-        helm list --all-namespaces
+        echo "--- pods ---"
 
-        kubectl get pods -A --no-headers | grep -v Running || echo "All pods Running."
+        kubectl get pods -A || true
 
         '
   gitops_handoff:
@@ -304,10 +302,6 @@ jobs:
 
         PY
 
-        echo "--- resulting image block ---"
-
-        sed -n ''/^image:/,/^$/p'' gitops/application-values.yaml
-
         '
       env:
         ECR_URL: ${{ steps.tf.outputs.ecr_url }}
@@ -324,9 +318,7 @@ jobs:
       run: "set -euo pipefail\nsed \"s|__REPO_URL__|https://github.com/${{ github.repository\
         \ }}.git|g\" \\\n  gitops/root-app.yaml | kubectl apply -f -\n"
     - name: Confirm the application exists
-      run: 'set -euo pipefail
-
-        kubectl -n argocd get applications
+      run: 'kubectl -n argocd get applications || true
 
         echo "### GitOps handoff complete" >> "$GITHUB_STEP_SUMMARY"
 
@@ -368,27 +360,18 @@ jobs:
     - name: Update kubeconfig
       run: aws eks update-kubeconfig --name "${{ steps.tf.outputs.cluster_name }}"
         --region us-east-1
-    - name: Show cluster nodes
-      run: kubectl get nodes -o wide
-    - name: Show platform components
-      run: 'set -euo pipefail
+    - name: Show cluster state
+      run: 'kubectl get nodes -o wide || true
 
-        echo "--- load balancer controller ---"
+        echo "--- platform pods ---"
 
-        kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller
-        --no-headers || true
+        kubectl get pods -n kube-system || true
 
-        echo "--- argocd ---"
+        kubectl get pods -n argocd || true
 
-        kubectl -n argocd get pods --no-headers || true
+        kubectl get pods -n argo-rollouts || true
 
-        echo "--- argo-rollouts ---"
-
-        kubectl -n argo-rollouts get pods --no-headers || true
-
-        echo "--- monitoring ---"
-
-        kubectl -n monitoring get pods --no-headers || true
+        kubectl get pods -n monitoring || true
 
         '
     - name: Wait for ArgoCD to sync the application

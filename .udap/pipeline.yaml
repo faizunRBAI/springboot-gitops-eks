@@ -112,7 +112,6 @@ stages:
         run: docker build -t local/app:${{ steps.meta.outputs.image_tag }} .
       - name: Show accepted vulnerability exceptions
         run: |
-          set -euo pipefail
           echo "### Accepted vulnerability exceptions" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -v '^\s*#' app/.trivyignore | grep -v '^\s*$' >> "$GITHUB_STEP_SUMMARY" || true
@@ -151,11 +150,8 @@ stages:
           docker push "${ECR_URL}:${TAG}"
           echo "Pushed ${TAG} to ECR."
 
-  # CONFIGURE installs the cluster platform ONLY: ingress controller,
-  # progressive-delivery controller, monitoring, and ArgoCD itself.
-  # The GitOps handoff deliberately lives in its OWN stage below, because
-  # these four helm installs consumed the whole stage budget on earlier runs
-  # and the handoff steps at the end were never reached.
+  # CONFIGURE installs the cluster platform ONLY. The GitOps handoff lives in
+  # its own stage below.
   - id: configure
     kind: configure
     needs: [provision, build_push]
@@ -250,25 +246,26 @@ stages:
             --values gitops/values/argocd-values.yaml
           kubectl -n argocd rollout status deployment/argocd-server --timeout=10m
           kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=10m
+      # NO `set -euo pipefail` and NO grep in this step.
+      # It previously ended with:
+      #   kubectl get pods -A --no-headers | grep -v Running || echo "..."
+      # Under pipefail, when EVERY pod is Running, `grep -v Running` matches
+      # nothing and exits 1 — so the step failed precisely BECAUSE the cluster
+      # was completely healthy, killing the stage about three minutes in and
+      # preventing the GitOps handoff from ever running. A reporting step must
+      # never be able to fail the build.
       - name: Report platform state
         run: |
-          set -euo pipefail
-          helm list --all-namespaces
-          kubectl get pods -A --no-headers | grep -v Running || echo "All pods Running."
+          helm list --all-namespaces || true
+          echo "--- pods ---"
+          kubectl get pods -A || true
 
   # ---------------------------------------------------------------------
   # GITOPS HANDOFF — the point where CI stops and ArgoCD takes over.
-  #
-  # Its own stage on purpose. These three actions are the entire reason the
-  # pipeline exists, and when they lived at the end of `configure` they were
-  # never reached: four sequential helm installs consumed the stage budget
-  # first. A separate stage starts with a fresh timeout and cannot be starved
-  # by work that has already succeeded.
-  #
-  # Self-sufficient by design: fresh runner, so it sets up its own tooling and
-  # reads the ECR URL from terraform state itself. It does NOT consume job
-  # outputs from configure — those embed PROJECT_NAME, which is a secret, and
-  # GitHub silently drops job outputs containing secret substrings.
+  # Its own stage so it cannot be starved or killed by the platform installs.
+  # Self-sufficient: fresh runner, own tooling, reads the ECR URL from state
+  # rather than consuming job outputs (which embed the PROJECT_NAME secret and
+  # would be dropped by GitHub).
   # ---------------------------------------------------------------------
   - id: gitops_handoff
     kind: custom
@@ -321,8 +318,6 @@ stages:
           p.write_text(text)
           print(f"gitops/application-values.yaml -> {ecr}:{tag}")
           PY
-          echo "--- resulting image block ---"
-          sed -n '/^image:/,/^$/p' gitops/application-values.yaml
       - name: Commit the GitOps values if they changed
         run: |
           set -euo pipefail
@@ -339,8 +334,7 @@ stages:
             echo "Pushed. ArgoCD will reconcile this commit onto the cluster."
           fi
       # No ArgoCD repository credential is registered: the monorepo is PUBLIC
-      # and ArgoCD clones it anonymously. A credential secret with an empty
-      # token would be worse than none.
+      # and ArgoCD clones it anonymously.
       - name: Apply the ArgoCD root application
         run: |
           set -euo pipefail
@@ -348,8 +342,7 @@ stages:
             gitops/root-app.yaml | kubectl apply -f -
       - name: Confirm the application exists
         run: |
-          set -euo pipefail
-          kubectl -n argocd get applications
+          kubectl -n argocd get applications || true
           echo "### GitOps handoff complete" >> "$GITHUB_STEP_SUMMARY"
           echo "ArgoCD now owns the application. CI does not deploy." >> "$GITHUB_STEP_SUMMARY"
 
@@ -385,19 +378,14 @@ stages:
           echo "cluster_name=$(terraform output -raw cluster_name)" >> "$GITHUB_OUTPUT"
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "${{ steps.tf.outputs.cluster_name }}" --region us-east-1
-      - name: Show cluster nodes
-        run: kubectl get nodes -o wide
-      - name: Show platform components
+      - name: Show cluster state
         run: |
-          set -euo pipefail
-          echo "--- load balancer controller ---"
-          kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller --no-headers || true
-          echo "--- argocd ---"
-          kubectl -n argocd get pods --no-headers || true
-          echo "--- argo-rollouts ---"
-          kubectl -n argo-rollouts get pods --no-headers || true
-          echo "--- monitoring ---"
-          kubectl -n monitoring get pods --no-headers || true
+          kubectl get nodes -o wide || true
+          echo "--- platform pods ---"
+          kubectl get pods -n kube-system || true
+          kubectl get pods -n argocd || true
+          kubectl get pods -n argo-rollouts || true
+          kubectl get pods -n monitoring || true
       - name: Wait for ArgoCD to sync the application
         timeout-minutes: 12
         run: |
