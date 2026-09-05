@@ -172,7 +172,7 @@ jobs:
       TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
       TF_VAR_region: us-east-1
       TF_VAR_github_repo: ${{ github.repository }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
     - uses: actions/checkout@v4
     - name: Set up Terraform
@@ -209,30 +209,39 @@ jobs:
         \ \\\n  --version 1.10.1 --namespace kube-system \\\n  --set clusterName=\"\
         ${{ steps.tf.outputs.cluster_name }}\" \\\n  --set region=us-east-1 \\\n \
         \ --set vpcId=\"${{ steps.tf.outputs.vpc_id }}\" \\\n  --set serviceAccount.create=false\
-        \ \\\n  --set serviceAccount.name=aws-load-balancer-controller \\\n  --wait\
-        \ --timeout 15m\n"
-    - name: Show controller state if it did not settle
-      run: 'set -euo pipefail
-
-        kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller
-        -o wide
-
-        '
+        \ \\\n  --set serviceAccount.name=aws-load-balancer-controller\nkubectl -n\
+        \ kube-system rollout status deployment/aws-load-balancer-controller --timeout=8m\n"
+      timeout-minutes: 12
     - name: Install Argo Rollouts controller
       run: "set -euo pipefail\nhelm repo add argo https://argoproj.github.io/argo-helm\n\
         helm repo update\nhelm upgrade --install argo-rollouts argo/argo-rollouts\
-        \ \\\n  --version 2.38.2 --namespace argo-rollouts --create-namespace \\\n\
-        \  --wait --timeout 15m\n"
+        \ \\\n  --version 2.38.2 --namespace argo-rollouts --create-namespace\nkubectl\
+        \ -n argo-rollouts rollout status deployment/argo-rollouts --timeout=8m\n"
+      timeout-minutes: 12
     - name: Install kube-prometheus-stack
       run: "set -euo pipefail\nhelm repo add prometheus-community https://prometheus-community.github.io/helm-charts\n\
         helm repo update\nhelm upgrade --install monitoring prometheus-community/kube-prometheus-stack\
         \ \\\n  --version 66.3.1 --namespace monitoring --create-namespace \\\n  --values\
         \ gitops/values/monitoring-values.yaml \\\n  --set grafana.adminPassword=\"\
-        ${{ secrets.GRAFANA_ADMIN_PASSWORD }}\" \\\n  --wait --timeout 20m\n"
+        ${{ secrets.GRAFANA_ADMIN_PASSWORD }}\"\necho \"Waiting for the Prometheus\
+        \ StatefulSet to become ready...\"\nkubectl -n monitoring rollout status statefulset/prometheus-monitoring-kube-prometheus-prometheus\
+        \ --timeout=15m\n"
+      timeout-minutes: 20
+    - name: Show monitoring state
+      run: 'set -euo pipefail
+
+        kubectl -n monitoring get pods -o wide
+
+        kubectl -n monitoring get pvc
+
+        '
     - name: Install ArgoCD
       run: "set -euo pipefail\nhelm upgrade --install argocd argo/argo-cd \\\n  --version\
-        \ 7.7.11 --namespace argocd --create-namespace \\\n  --values gitops/values/argocd-values.yaml\
-        \ \\\n  --wait --timeout 15m\n"
+        \ 7.7.11 --namespace argocd --create-namespace \\\n  --values gitops/values/argocd-values.yaml\n\
+        kubectl -n argocd rollout status deployment/argocd-server --timeout=10m\n\
+        kubectl -n argocd rollout status statefulset/argocd-application-controller\
+        \ --timeout=10m\n"
+      timeout-minutes: 15
     - name: Point the GitOps values at the real ECR repository and image tag
       run: 'set -euo pipefail
 
@@ -280,7 +289,8 @@ jobs:
         fi\n"
     - name: Apply the ArgoCD root application
       run: "set -euo pipefail\nsed \"s|__REPO_URL__|https://github.com/${{ github.repository\
-        \ }}.git|g\" \\\n  gitops/root-app.yaml | kubectl apply -f -\n"
+        \ }}.git|g\" \\\n  gitops/root-app.yaml | kubectl apply -f -\necho \"Root\
+        \ application applied:\"\nkubectl -n argocd get applications\n"
   verify:
     runs-on: ubuntu-latest
     needs:

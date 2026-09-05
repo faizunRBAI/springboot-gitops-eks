@@ -155,7 +155,11 @@ stages:
   - id: configure
     kind: configure
     needs: [provision, build_push]
-    timeout_minutes: 45
+    # 60 minutes: four helm installs plus their readiness waits. The previous
+    # 45 was consumed by the LBC and Rollouts waits, leaving too little for
+    # Prometheus to attach its EBS volume, so the STAGE timed out while the
+    # install itself was succeeding.
+    timeout_minutes: 60
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -190,18 +194,13 @@ stages:
           echo "vpc_id=$(terraform output -raw vpc_id)" >> "$GITHUB_OUTPUT"
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "${{ steps.tf.outputs.cluster_name }}" --region us-east-1
-      # vpcId IS MANDATORY HERE.
-      # Without it the controller discovers its VPC by calling EC2 IMDS from
-      # inside the pod. EKS nodes default to IMDSv2 with a hop limit of 1, and
-      # a pod-originated call takes one hop too many, so IMDS never answers:
-      #   "unable to initialize AWS cloud", "failed to get VPC ID: ...
-      #    ec2imds: GetMetadata, canceled, context deadline exceeded"
-      # The pods then CrashLoopBackOff and helm --wait reports only the
-      # unhelpful "Error: context deadline exceeded".
-      # Passing the VPC ID explicitly avoids IMDS entirely. Do NOT instead
-      # raise the node hop limit to 2 — that exposes the node's instance
-      # credentials to every pod on the host.
+      # vpcId IS MANDATORY. Without it the controller discovers its VPC via EC2
+      # IMDS from inside the pod; EKS nodes default to an IMDSv2 hop limit of 1
+      # and a pod-originated call takes one hop too many, so IMDS never answers
+      # and the pods CrashLoopBackOff. Do NOT raise the node hop limit to 2 —
+      # that exposes node instance credentials to every pod on the host.
       - name: Install AWS Load Balancer Controller
+        timeout-minutes: 12
         run: |
           set -euo pipefail
           helm repo add eks https://aws.github.io/eks-charts
@@ -216,21 +215,24 @@ stages:
             --set region=us-east-1 \
             --set vpcId="${{ steps.tf.outputs.vpc_id }}" \
             --set serviceAccount.create=false \
-            --set serviceAccount.name=aws-load-balancer-controller \
-            --wait --timeout 15m
-      - name: Show controller state if it did not settle
-        run: |
-          set -euo pipefail
-          kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o wide
+            --set serviceAccount.name=aws-load-balancer-controller
+          kubectl -n kube-system rollout status deployment/aws-load-balancer-controller --timeout=8m
       - name: Install Argo Rollouts controller
+        timeout-minutes: 12
         run: |
           set -euo pipefail
           helm repo add argo https://argoproj.github.io/argo-helm
           helm repo update
           helm upgrade --install argo-rollouts argo/argo-rollouts \
-            --version 2.38.2 --namespace argo-rollouts --create-namespace \
-            --wait --timeout 15m
+            --version 2.38.2 --namespace argo-rollouts --create-namespace
+          kubectl -n argo-rollouts rollout status deployment/argo-rollouts --timeout=8m
+      # helm --wait is deliberately NOT used for this chart. It waits on every
+      # object in a large release at once and reports only "context deadline
+      # exceeded" on timeout, which says nothing about what was slow. Waiting
+      # explicitly on the StatefulSet is faster to satisfy, and the diagnostic
+      # step below shows exactly which pod is not ready if it is not.
       - name: Install kube-prometheus-stack
+        timeout-minutes: 20
         run: |
           set -euo pipefail
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
@@ -238,15 +240,23 @@ stages:
           helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
             --version 66.3.1 --namespace monitoring --create-namespace \
             --values gitops/values/monitoring-values.yaml \
-            --set grafana.adminPassword="${{ secrets.GRAFANA_ADMIN_PASSWORD }}" \
-            --wait --timeout 20m
+            --set grafana.adminPassword="${{ secrets.GRAFANA_ADMIN_PASSWORD }}"
+          echo "Waiting for the Prometheus StatefulSet to become ready..."
+          kubectl -n monitoring rollout status statefulset/prometheus-monitoring-kube-prometheus-prometheus --timeout=15m
+      - name: Show monitoring state
+        run: |
+          set -euo pipefail
+          kubectl -n monitoring get pods -o wide
+          kubectl -n monitoring get pvc
       - name: Install ArgoCD
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           helm upgrade --install argocd argo/argo-cd \
             --version 7.7.11 --namespace argocd --create-namespace \
-            --values gitops/values/argocd-values.yaml \
-            --wait --timeout 15m
+            --values gitops/values/argocd-values.yaml
+          kubectl -n argocd rollout status deployment/argocd-server --timeout=10m
+          kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=10m
       - name: Point the GitOps values at the real ECR repository and image tag
         working-directory: infra
         run: |
@@ -287,6 +297,8 @@ stages:
           set -euo pipefail
           sed "s|__REPO_URL__|https://github.com/${{ github.repository }}.git|g" \
             gitops/root-app.yaml | kubectl apply -f -
+          echo "Root application applied:"
+          kubectl -n argocd get applications
 
   - id: verify
     kind: verify
