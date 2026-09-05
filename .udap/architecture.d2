@@ -2,35 +2,40 @@
 
 dev: Developer { shape: person; udap-type: generic.user }
 user: End User { shape: person; udap-type: generic.user }
+viewer: Public Viewer (demo) { shape: person; udap-type: generic.user }
 github: GitHub Monorepo { udap-type: generic.app }
 actions: GitHub Actions CI { udap-type: generic.app }
-oidc: GitHub OIDC Provider (IAM) { udap-type: aws.iam }
 ecr: ECR Image Registry { udap-type: aws.ecr }
 vpc: VPC 10.0.0.0/16 (3 AZ) {
-  alb: Application Load Balancer { udap-type: aws.alb }
+  alb: App ALB (internet-facing, HTTP) { udap-type: aws.alb }
+  alb_mon: Grafana ALB (public, HTTP) { udap-type: aws.alb }
+  alb_argo: ArgoCD ALB (public, HTTP) { udap-type: aws.alb }
   nat: NAT Gateway (single) { udap-type: aws.nat }
   eks: EKS Control Plane 1.33 { udap-type: aws.eks }
   nodes: Managed Node Group (t3.medium x2) { udap-type: aws.ec2 }
-  argocd: ArgoCD { udap-type: generic.app }
+  argocd: ArgoCD (admin console) { udap-type: generic.app }
   rollouts: Argo Rollouts Controller { udap-type: generic.app }
   app: Spring Boot Rollout (blue/green + canary) { udap-type: generic.app }
-  prometheus: Prometheus { udap-type: generic.app }
+  prometheus: Prometheus (internal only) { udap-type: generic.app }
   grafana: Grafana { udap-type: generic.app }
 }
 
 dev -> github: push code
+dev -> github: promote image tag (manual commit)
 github -> actions: workflow dispatch (path-filtered)
-actions -> oidc: assume role (no static keys)
-oidc -> ecr: authorize push
-actions -> ecr: push image (sha tag)
-actions -> github: bump gitops image tag [skip ci]
+actions -> ecr: push image (static keys, sha tag)
+actions -> vpc.argocd: apply root Application
 github -> vpc.argocd: poll desired state
 vpc.argocd -> vpc.app: sync manifests (sole cluster writer)
 vpc.rollouts -> vpc.app: manage blue/green + canary steps
 vpc.nodes -> ecr: pull image
 vpc.nodes -> vpc.nat: egress
-user -> vpc.alb: HTTPS
+user -> vpc.alb: HTTP 80
 vpc.alb -> vpc.app: route traffic
+viewer -> vpc.alb_mon: HTTP 80 (no TLS, no SSO)
+vpc.alb_mon -> vpc.grafana: dashboards
+viewer -> vpc.alb_argo: HTTP 80 (no TLS, no SSO)
+vpc.alb_argo -> vpc.argocd: admin console
 vpc.prometheus -> vpc.app: scrape /actuator/prometheus
 vpc.rollouts -> vpc.prometheus: query canary analysis
 vpc.grafana -> vpc.prometheus: query metrics

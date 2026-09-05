@@ -3,6 +3,12 @@
 Spring Boot service delivered to AWS EKS through a DevSecOps + GitOps pipeline:
 **code → test → image scan → ECR → ArgoCD → EKS → blue/green or canary → monitoring → rollback.**
 
+> ⚠️ **This is a demo/test environment, not a production one.** The ArgoCD
+> admin console and the Grafana dashboards are both published to the public
+> internet over plain HTTP with no TLS and no SSO. See
+> [Public exposure](#public-exposure--read-before-reusing-this) before reusing
+> any of this configuration.
+
 ---
 
 ## Architecture
@@ -36,13 +42,20 @@ Developer commits the new tag to gitops/ ─────────────
                                    │   Spring Boot pods ◀── ALB        │
                                    │        │                          │
                                    │        ▼ /actuator/prometheus     │
-                                   │   Prometheus ──▶ Grafana          │
+                                   │   Prometheus ──▶ Grafana ◀── ALB  │
                                    │        │                          │
                                    │        └──▶ canary analysis       │
+                                   │                                   │
+                                   │   ArgoCD UI ◀── ALB (public)      │
                                    └───────────────────────────────────┘
 ```
 
 The canonical diagram is [`.udap/architecture.d2`](.udap/architecture.d2).
+
+Three separate ALBs: the application, Grafana, and the ArgoCD console. They are
+deliberately not shared via `group.name` — coupling a demo dashboard's or an
+admin console's availability to the application's ingress would mean an ingress
+mistake in one takes down the others.
 
 ---
 
@@ -123,8 +136,8 @@ chart/                   Helm chart
 gitops/                  ArgoCD configuration
   root-app.yaml                  ArgoCD Application (app-of-apps entry point)
   application-values.yaml        THE HANDOFF (image tag lives here)
-  values/argocd-values.yaml      ArgoCD install values
-  values/monitoring-values.yaml  kube-prometheus-stack values
+  values/argocd-values.yaml      ArgoCD install values (PUBLIC ingress)
+  values/monitoring-values.yaml  kube-prometheus-stack values (PUBLIC Grafana)
 infra/                   Terraform (AWS)
   network.tf             VPC, 3 AZs, single NAT gateway
   eks.tf                 EKS 1.33 control plane, node group, addons, IRSA
@@ -192,28 +205,59 @@ rolling back means changing Git. Levels 1–2 are faster for an in-flight rollou
 
 ```bash
 aws eks update-kubeconfig --name springboot-gitops-eks --region us-east-1
+```
 
-# Application URL
-kubectl -n springboot-app get ingress springboot-app \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+| Surface | Address | Auth |
+|---|---|---|
+| Application | `kubectl -n springboot-app get ingress springboot-app` | none (public app) |
+| **ArgoCD console** | `kubectl -n argocd get ingress argocd-server` | admin / `ARGOCD_ADMIN_PASSWORD` |
+| **Grafana** | `kubectl -n monitoring get ingress monitoring-grafana` | admin / `GRAFANA_ADMIN_PASSWORD` |
+| Prometheus | internal only | none — `port-forward` |
 
-# ArgoCD UI (ClusterIP by design — not exposed publicly)
-kubectl -n argocd port-forward svc/argocd-server 8080:80
-# then http://localhost:8080 (user: admin)
-kubectl -n argocd get secret argocd-initial-admin-secret \
-  -o jsonpath='{.data.password}' | base64 -d
-
-# Grafana
-kubectl -n monitoring port-forward svc/monitoring-grafana 3000:80
-# then http://localhost:3000 (user: admin, password: GRAFANA_ADMIN_PASSWORD secret)
+```bash
+# Prometheus stays internal: its query API is unauthenticated and exposes every
+# metric in the cluster, plus the admin API.
+kubectl -n monitoring port-forward svc/monitoring-kube-prometheus-prometheus 9090:9090
 
 # Rollout status, live
 kubectl argo rollouts get rollout springboot-app -n springboot-app --watch
 ```
 
-ArgoCD and Grafana are deliberately **not** internet-facing. Both are
-admin-credentialed; exposing them is a Tier-2 decision that needs SSO in
-front, not a default.
+### Public exposure — read before reusing this
+
+**ArgoCD and Grafana are both published on internet-facing ALBs over plain
+HTTP, reachable from `0.0.0.0/0`.** This was an explicit, informed choice for a
+demo environment holding no real data. It is **not** a pattern to copy.
+
+What that means concretely:
+
+- **ArgoCD is a control plane, not a dashboard.** Its `admin` account can sync,
+  delete and mutate every resource ArgoCD manages. Whoever has the password
+  effectively controls the cluster.
+- **No TLS.** Both admin passwords cross the internet in cleartext on every
+  login and are readable by anyone on the network path.
+- **No SSO, no MFA, no source-IP restriction.** The password is the only
+  control, and ALB hostnames are continuously scanned — an exposed ArgoCD login
+  is a known target.
+
+Prometheus is deliberately **not** exposed: its API needs no credential at all,
+so an ALB in front of it is an open read of the whole cluster's telemetry.
+
+**Both admin passwords have been rotated** away from their chart bootstrap
+values, and `argocd-initial-admin-secret` is deleted after install so a stale
+credential cannot mislead. They live only as repository secrets.
+
+**Before any of this is production, all three are required — not one:**
+
+1. TLS via cert-manager + ACM/Route53, with an 80 → 443 redirect.
+2. SSO (ArgoCD dex/OIDC, Grafana OAuth) **or**
+   `alb.ingress.kubernetes.io/inbound-cidrs` restricting the ALBs to known
+   source addresses.
+3. Rotate both passwords again, since they have travelled unencrypted.
+
+A fourth worth doing: expose an ArgoCD **read-only RBAC role** rather than
+`admin`, so the demo audience cannot delete anything even if the password
+leaks.
 
 ---
 
@@ -231,10 +275,14 @@ front, not a default.
   capabilities dropped, `RuntimeDefault` seccomp.
 - **Private nodes.** Workers have no public IPs; egress goes through the NAT.
 - **No secrets in Git.** All credentials are repository secrets referenced as
-  `${{ secrets.NAME }}`; none are committed.
+  `${{ secrets.NAME }}`; none are committed. The ArgoCD admin password is
+  bcrypt-hashed at install time by the `argocd` binary in its own image, so
+  neither the plaintext nor the hash is ever committed.
 - **CI cannot write to the repository**, which removes an entire class of
   supply-chain risk — though here it is a platform constraint rather than a
   deliberate choice (see above).
+- **Admin consoles are internet-facing** — the one significant weakness, and a
+  deliberate demo trade-off. See [Public exposure](#public-exposure--read-before-reusing-this).
 
 ### CI authentication: static keys, not OIDC — and why
 
@@ -309,6 +357,9 @@ authentication is added, any endpoint becomes access-controlled, or a
 security-constraint / DIGEST / FORM login config is introduced. In those cases
 remove the entries and upgrade Tomcat *first*.
 
+> Note: this exemption covers the **application** only. It does not extend to
+> ArgoCD or Grafana, which *do* have authentication and are now internet-facing.
+
 **To retire it:** bump the Spring Boot parent once a release manages Tomcat
 ≥ 10.1.58, or set `<tomcat.version>10.1.58</tomcat.version>` in `app/pom.xml`
 once that release is on Maven Central, then delete the entries. Enabling
@@ -321,6 +372,9 @@ prints them in the job summary on every run.
 
 ### Known gaps (deliberate, not oversights)
 
+- **ArgoCD and Grafana are internet-facing over HTTP** — see
+  [Public exposure](#public-exposure--read-before-reusing-this). The largest
+  gap by blast radius.
 - **CI uses long-lived AWS credentials** — see above.
 - **Image promotion is a manual commit** — see above.
 - **No source-level dependency scanner.** OWASP dependency-check was removed:
@@ -342,14 +396,18 @@ prints them in the job summary on every run.
 
 ## Cost
 
-Roughly **$185/month** running continuously:
+Roughly **$202/month** running continuously:
 
 | Component | Monthly |
 |---|---|
 | EKS control plane | ~$73 |
 | 2 × t3.medium nodes | ~$60 |
 | NAT gateway (single) | ~$32 |
-| ALB + ECR storage | ~$18 |
+| 3 × ALB (app, Grafana, ArgoCD) + ECR storage | ~$37 |
+
+Each public console costs its own ALB, roughly $16–18/month. Removing the
+ArgoCD and Grafana ingresses and returning to `port-forward` takes this back to
+about $168.
 
 **Single NAT gateway** is a deliberate choice: the AWS probe measured an
 Elastic IP quota of 5 in this account, and one NAT per AZ would consume 3 EIPs
@@ -366,10 +424,11 @@ and all configuration survive, so redeploying later is a single action.
 1. **Provision** — Terraform builds the VPC, EKS, ECR, EBS CSI and IAM.
 2. **Build and push** — image built, Trivy-scanned, pushed to ECR.
 3. **Configure** — installs the Load Balancer Controller, Argo Rollouts,
-   kube-prometheus-stack and ArgoCD.
+   kube-prometheus-stack and ArgoCD (rotating the ArgoCD admin password).
 4. **GitOps handoff** — verifies the committed values are concrete and applies
    the ArgoCD root Application.
-5. **Verify** — waits for ArgoCD to report Synced/Healthy, then probes the ALB.
+5. **Verify** — waits for ArgoCD to report the application Healthy, probes the
+   ALB, and reports the public console addresses.
 
 Afterwards, every `app/**` commit runs the `app-delivery` workflow, which
 publishes a new image and prints the tag to promote.
@@ -378,7 +437,8 @@ publishes a new image and prints the tag to promote.
 
 | Secret | Purpose | Who sets it |
 |---|---|---|
-| `GRAFANA_ADMIN_PASSWORD` | Grafana admin login | Generated at setup |
+| `GRAFANA_ADMIN_PASSWORD` | Grafana admin login (public ALB) | Generated at setup |
+| `ARGOCD_ADMIN_PASSWORD` | ArgoCD admin login (public ALB) | Generated at setup |
 | `AWS_CI_ROLE_ARN` | OIDC role ARN — set, but unused until the platform supports `id-token` | From `terraform output ci_role_arn` |
 
 `PROJECT_NAME`, `TF_STATE_BUCKET` and the AWS credentials are injected by the

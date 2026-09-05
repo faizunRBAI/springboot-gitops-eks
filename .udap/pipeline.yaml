@@ -250,15 +250,38 @@ stages:
             --values gitops/values/monitoring-values.yaml \
             --set grafana.adminPassword="${{ secrets.GRAFANA_ADMIN_PASSWORD }}"
           kubectl -n monitoring rollout status statefulset/prometheus-monitoring-kube-prometheus-prometheus --timeout=15m
+      # The ArgoCD UI is published on a public ALB, so the admin credential is a
+      # ROTATED secret rather than the chart's never-rotated bootstrap value in
+      # argocd-initial-admin-secret.
+      #
+      # The chart wants a BCRYPT HASH here, not plaintext — plaintext produces a
+      # login that can never succeed. htpasswd (apache2-utils, preinstalled on
+      # ubuntu-latest) generates it with -B (bcrypt) and -i (read the secret
+      # from STDIN, so it never appears as a process argument). Only the
+      # plaintext lives in the secret store; no hash is committed to Git.
       - name: Install ArgoCD
         timeout-minutes: 15
+        env:
+          ADMIN_SECRET: ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
         run: |
           set -euo pipefail
+          HASH=$(printf '%s' "${ADMIN_SECRET}" | htpasswd -niBC 10 admin | cut -d: -f2)
+          if [ -z "${HASH}" ]; then
+            echo "ERROR: could not derive the ArgoCD admin credential hash."
+            exit 1
+          fi
           helm upgrade --install argocd argo/argo-cd \
             --version 7.7.11 --namespace argocd --create-namespace \
-            --values gitops/values/argocd-values.yaml
+            --values gitops/values/argocd-values.yaml \
+            --set-string configs.secret.argocdServerAdminPassword="${HASH}"
           kubectl -n argocd rollout status deployment/argocd-server --timeout=10m
           kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=10m
+      # The bootstrap credential is superseded by the rotated one above. Leaving
+      # it in the cluster means a second valid-looking secret that no longer
+      # matches the live login, which misleads whoever reads it next.
+      - name: Remove the superseded bootstrap admin secret
+        run: |
+          kubectl -n argocd delete secret argocd-initial-admin-secret --ignore-not-found=true || true
       # Reporting only — must never be able to fail the build. No pipefail, no
       # grep: `grep -v Running` exits 1 when every pod IS Running, which once
       # failed this stage precisely because the cluster was healthy.
@@ -484,6 +507,42 @@ stages:
           kubectl -n springboot-app describe ingress springboot-app || true
           kubectl -n springboot-app get pods -o wide || true
           exit 1
+      # Probe the public ArgoCD console and report its address, so the exposure
+      # is visible in the run summary rather than only in a values-file comment.
+      # Reporting only: a slow ALB registration must not fail an otherwise good
+      # deploy, so this never exits non-zero.
+      - name: Report the ArgoCD console address
+        timeout-minutes: 8
+        run: |
+          ARGOCD_HOST=""
+          for i in $(seq 1 20); do
+            ARGOCD_HOST=$(kubectl -n argocd get ingress argocd-server \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [ -n "${ARGOCD_HOST}" ]; then
+              break
+            fi
+            echo "attempt ${i}: ArgoCD ingress address not assigned yet"
+            sleep 15
+          done
+          {
+            echo "### ArgoCD console — PUBLIC, HTTP, admin-credentialed"
+            echo ""
+            if [ -n "${ARGOCD_HOST}" ]; then
+              echo "http://${ARGOCD_HOST}"
+              echo ""
+              if curl --fail --silent --show-error --max-time 10 \
+                   "http://${ARGOCD_HOST}/healthz" >/dev/null 2>&1; then
+                echo "Health check: serving."
+              else
+                echo "Health check: not answering yet (ALB target registration"
+                echo "takes a few minutes after the ingress is created)."
+              fi
+            else
+              echo "Ingress address not assigned yet."
+            fi
+            echo ""
+            echo "Reachable from 0.0.0.0/0 with no TLS and no SSO. Demo only."
+          } >> "$GITHUB_STEP_SUMMARY"
 
 pipelines:
   # ---------------------------------------------------------------------

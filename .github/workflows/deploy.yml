@@ -232,12 +232,22 @@ jobs:
         \ statefulset/prometheus-monitoring-kube-prometheus-prometheus --timeout=15m\n"
       timeout-minutes: 20
     - name: Install ArgoCD
-      run: "set -euo pipefail\nhelm upgrade --install argocd argo/argo-cd \\\n  --version\
-        \ 7.7.11 --namespace argocd --create-namespace \\\n  --values gitops/values/argocd-values.yaml\n\
-        kubectl -n argocd rollout status deployment/argocd-server --timeout=10m\n\
-        kubectl -n argocd rollout status statefulset/argocd-application-controller\
-        \ --timeout=10m\n"
+      run: "set -euo pipefail\nHASH=$(printf '%s' \"${ADMIN_SECRET}\" | htpasswd -niBC\
+        \ 10 admin | cut -d: -f2)\nif [ -z \"${HASH}\" ]; then\n  echo \"ERROR: could\
+        \ not derive the ArgoCD admin credential hash.\"\n  exit 1\nfi\nhelm upgrade\
+        \ --install argocd argo/argo-cd \\\n  --version 7.7.11 --namespace argocd\
+        \ --create-namespace \\\n  --values gitops/values/argocd-values.yaml \\\n\
+        \  --set-string configs.secret.argocdServerAdminPassword=\"${HASH}\"\nkubectl\
+        \ -n argocd rollout status deployment/argocd-server --timeout=10m\nkubectl\
+        \ -n argocd rollout status statefulset/argocd-application-controller --timeout=10m\n"
       timeout-minutes: 15
+      env:
+        ADMIN_SECRET: ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+    - name: Remove the superseded bootstrap admin secret
+      run: 'kubectl -n argocd delete secret argocd-initial-admin-secret --ignore-not-found=true
+        || true
+
+        '
     - name: Report platform state
       run: 'helm list --all-namespaces || true
 
@@ -388,3 +398,18 @@ jobs:
         \ follow:\"\nkubectl -n springboot-app describe ingress springboot-app ||\
         \ true\nkubectl -n springboot-app get pods -o wide || true\nexit 1\n"
       timeout-minutes: 12
+    - name: Report the ArgoCD console address
+      run: "ARGOCD_HOST=\"\"\nfor i in $(seq 1 20); do\n  ARGOCD_HOST=$(kubectl -n\
+        \ argocd get ingress argocd-server \\\n    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'\
+        \ 2>/dev/null || echo \"\")\n  if [ -n \"${ARGOCD_HOST}\" ]; then\n    break\n\
+        \  fi\n  echo \"attempt ${i}: ArgoCD ingress address not assigned yet\"\n\
+        \  sleep 15\ndone\n{\n  echo \"### ArgoCD console \u2014 PUBLIC, HTTP, admin-credentialed\"\
+        \n  echo \"\"\n  if [ -n \"${ARGOCD_HOST}\" ]; then\n    echo \"http://${ARGOCD_HOST}\"\
+        \n    echo \"\"\n    if curl --fail --silent --show-error --max-time 10 \\\
+        \n         \"http://${ARGOCD_HOST}/healthz\" >/dev/null 2>&1; then\n     \
+        \ echo \"Health check: serving.\"\n    else\n      echo \"Health check: not\
+        \ answering yet (ALB target registration\"\n      echo \"takes a few minutes\
+        \ after the ingress is created).\"\n    fi\n  else\n    echo \"Ingress address\
+        \ not assigned yet.\"\n  fi\n  echo \"\"\n  echo \"Reachable from 0.0.0.0/0\
+        \ with no TLS and no SSO. Demo only.\"\n} >> \"$GITHUB_STEP_SUMMARY\"\n"
+      timeout-minutes: 8
