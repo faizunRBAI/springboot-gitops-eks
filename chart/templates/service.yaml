@@ -1,0 +1,58 @@
+# Stable/active service — always points at the production-serving ReplicaSet.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "app.selectorLabels" . | nindent 4 }}
+---
+{{- if eq .Values.rollout.strategy "blueGreen" }}
+# PREVIEW service (blue/green): routes to the green stack before promotion.
+# Lets you exercise the new version with real requests while zero production
+# traffic reaches it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "app.fullname" . }}-preview
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+    role: preview
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "app.selectorLabels" . | nindent 4 }}
+{{- else }}
+# CANARY service: the Rollouts controller manages its selector so it targets
+# only canary pods. The ALB splits traffic between this and the stable service
+# according to the current setWeight step.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "app.fullname" . }}-canary
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+    role: canary
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "app.selectorLabels" . | nindent 4 }}
+{{- end }}

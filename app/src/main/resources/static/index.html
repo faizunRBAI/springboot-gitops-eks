@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>springboot-gitops-eks</title>
+  <style>
+    :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --muted:#8b949e; --ok:#3fb950; --accent:#58a6ff; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--fg);
+           font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+           display:flex; align-items:center; justify-content:center; min-height:100vh; padding:2rem; }
+    .wrap { width:100%; max-width:760px; }
+    h1 { margin:0 0 .25rem; font-size:1.6rem; letter-spacing:-.02em; }
+    .sub { color:var(--muted); margin-bottom:1.5rem; font-size:.95rem; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:1.25rem 1.5rem; margin-bottom:1rem; }
+    .row { display:flex; justify-content:space-between; gap:1rem; padding:.55rem 0; border-bottom:1px solid var(--line); font-size:.92rem; }
+    .row:last-child { border-bottom:none; }
+    .k { color:var(--muted); }
+    .v { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--accent); text-align:right; word-break:break-all; }
+    .badge { display:inline-flex; align-items:center; gap:.45rem; color:var(--ok); font-size:.85rem; }
+    .dot { width:8px; height:8px; border-radius:50%; background:var(--ok); }
+    .flow { display:flex; flex-wrap:wrap; gap:.4rem; align-items:center; font-size:.8rem; color:var(--muted); }
+    .step { background:#21262d; border:1px solid var(--line); border-radius:6px; padding:.3rem .6rem; white-space:nowrap; }
+    footer { color:var(--muted); font-size:.8rem; text-align:center; margin-top:1.25rem; }
+    a { color:var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>springboot-gitops-eks</h1>
+    <div class="sub">Spring Boot on EKS &mdash; delivered by GitHub Actions, ArgoCD and Argo Rollouts.</div>
+
+    <div class="card">
+      <div class="row"><span class="k">Status</span>
+        <span class="v"><span class="badge"><span class="dot"></span>running</span></span></div>
+      <div class="row"><span class="k">Version</span><span class="v" id="version">&hellip;</span></div>
+      <div class="row"><span class="k">Image tag</span><span class="v" id="imageTag">&hellip;</span></div>
+      <div class="row"><span class="k">Pod</span><span class="v" id="podName">&hellip;</span></div>
+      <div class="row"><span class="k">Uptime</span><span class="v" id="uptime">&hellip;</span></div>
+    </div>
+
+    <div class="card">
+      <div class="flow">
+        <span class="step">git push</span> &rarr;
+        <span class="step">test + scan</span> &rarr;
+        <span class="step">image</span> &rarr;
+        <span class="step">ECR</span> &rarr;
+        <span class="step">ArgoCD</span> &rarr;
+        <span class="step">EKS</span> &rarr;
+        <span class="step">blue/green &middot; canary</span>
+      </div>
+    </div>
+
+    <footer>
+      <a href="/api/info">/api/info</a> &middot;
+      <a href="/actuator/health">/actuator/health</a> &middot;
+      <a href="/actuator/prometheus">/actuator/prometheus</a>
+      <div style="margin-top:.5rem">This panel refreshes every 2s &mdash; during a rollout the pod and image tag change here.</div>
+    </footer>
+  </div>
+
+  <script>
+    async function refresh() {
+      try {
+        const r = await fetch('/api/info', { cache: 'no-store' });
+        if (!r.ok) return;
+        const d = await r.json();
+        document.getElementById('version').textContent  = d.version;
+        document.getElementById('imageTag').textContent = d.imageTag;
+        document.getElementById('podName').textContent  = d.podName;
+        document.getElementById('uptime').textContent   = d.uptimeSeconds + 's';
+      } catch (e) { /* transient during a cutover; next tick recovers */ }
+    }
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

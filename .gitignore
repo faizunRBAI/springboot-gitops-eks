@@ -1,0 +1,38 @@
+# Java / Maven
+target/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+*.war
+*.log
+
+# Terraform — never commit state or local overrides
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+crash.log
+override.tf
+override.tf.json
+
+# Secrets / environment
+.env
+.env.*
+*.pem
+*.key
+kubeconfig
+!chart/**/*.key
+
+# Helm
+charts/*.tgz
+
+# Security scan output
+dependency-check-report.*
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store

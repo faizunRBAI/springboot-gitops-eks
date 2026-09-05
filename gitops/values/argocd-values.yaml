@@ -1,0 +1,83 @@
+# Values for the argo-cd Helm chart (installed by the configure stage).
+
+configs:
+  params:
+    # Single-cluster install: TLS is terminated at the ALB, so running the
+    # API server insecure INSIDE the cluster avoids a redirect loop.
+    server.insecure: true
+
+  cm:
+    # Resource exclusions cut reconciliation noise.
+    resource.exclusions: |
+      - apiGroups:
+          - "metrics.k8s.io"
+        kinds:
+          - "PodMetrics"
+        clusters:
+          - "*"
+
+    # Teach ArgoCD how to judge Rollout health. Without this, ArgoCD reports a
+    # paused canary as Progressing forever and the verify stage times out on a
+    # rollout that is actually working as designed.
+    resource.customizations.health.argoproj.io_Rollout: |
+      hs = {}
+      if obj.status ~= nil then
+        if obj.status.phase ~= nil then
+          if obj.status.phase == "Healthy" then
+            hs.status = "Healthy"
+            hs.message = "Rollout is healthy"
+            return hs
+          elseif obj.status.phase == "Paused" then
+            hs.status = "Suspended"
+            hs.message = "Rollout is paused for analysis or manual promotion"
+            return hs
+          elseif obj.status.phase == "Degraded" then
+            hs.status = "Degraded"
+            hs.message = "Rollout is degraded"
+            return hs
+          end
+        end
+      end
+      hs.status = "Progressing"
+      hs.message = "Rollout is progressing"
+      return hs
+
+server:
+  # ClusterIP + port-forward. A public ArgoCD UI is an admin-credentialed
+  # internet-facing endpoint; exposing it is a deliberate Tier-2 decision with
+  # SSO in front, not a default.
+  service:
+    type: ClusterIP
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+controller:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+
+repoServer:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+applicationSet:
+  enabled: false
+
+notifications:
+  enabled: false
+
+dex:
+  # No external identity provider wired yet; disabled to save resources.
+  enabled: false

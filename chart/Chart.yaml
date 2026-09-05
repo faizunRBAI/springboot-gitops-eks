@@ -1,0 +1,20 @@
+apiVersion: v2
+name: springboot-gitops-eks
+description: Spring Boot service on EKS with Argo Rollouts progressive delivery
+type: application
+
+# Chart version: bumped when the TEMPLATES change.
+version: 0.1.0
+
+# Application version: the DEFAULT image tag. CI overwrites the tag in
+# gitops/application-values.yaml rather than editing this file, so the chart
+# and the deployed revision stay independently versioned.
+appVersion: "0.0.1"
+
+keywords:
+  - spring-boot
+  - argo-rollouts
+  - progressive-delivery
+
+maintainers:
+  - name: platform-team

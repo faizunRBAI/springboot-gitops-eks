@@ -1,0 +1,93 @@
+# Values for kube-prometheus-stack (Prometheus + Grafana + Alertmanager).
+# Sized for a 2-node t3.medium cluster.
+
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    retentionSize: 8GB
+
+    # CRITICAL for this project: by default the operator only scrapes
+    # ServiceMonitors carrying its own release label. Setting these to false
+    # lets it discover the application's ServiceMonitor in another namespace.
+    # Without this, Prometheus has no app metrics and every canary
+    # AnalysisRun returns "no datapoints" — the rollout stalls rather than
+    # progressing, and the cause is invisible from the rollout status alone.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+    resources:
+      requests:
+        cpu: 200m
+        memory: 1Gi
+      limits:
+        memory: 2Gi
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+
+grafana:
+  # adminPassword is injected by the configure stage via --set from a
+  # repository secret. Never commit a value here.
+  service:
+    type: ClusterIP
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+  # Auto-load community dashboards for the JVM and Spring Boot.
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: default
+          orgId: 1
+          folder: ""
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+
+  dashboards:
+    default:
+      # JVM (Micrometer) — heap, GC, threads.
+      jvm-micrometer:
+        gnetId: 4701
+        revision: 10
+        datasource: Prometheus
+      # Kubernetes cluster overview.
+      kubernetes-cluster:
+        gnetId: 315
+        revision: 3
+        datasource: Prometheus
+
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 256Mi
+
+# The EKS-managed control plane does not expose these components to scraping;
+# leaving them enabled produces permanently-firing "target down" alerts that
+# train people to ignore alerts.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false

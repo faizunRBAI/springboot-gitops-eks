@@ -1,0 +1,75 @@
+{{- if .Values.rollout.canary.analysis.enabled }}
+# ---------------------------------------------------------------------------
+# AnalysisTemplate — the difference between a real canary and a timer.
+#
+# Argo Rollouts runs these queries against Prometheus while the canary serves
+# traffic. If a metric breaches its threshold `failureLimit` times in a row,
+# the rollout ABORTS automatically: traffic returns to the stable ReplicaSet
+# with no human in the loop.
+#
+# Requires /actuator/prometheus (micrometer-registry-prometheus) and the
+# ServiceMonitor that makes Prometheus scrape it.
+# ---------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: {{ include "app.fullname" . }}-success-rate
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  args:
+    - name: service-name
+    - name: namespace
+
+  metrics:
+    # ---- Metric 1: HTTP success rate --------------------------------------
+    - name: success-rate
+      interval: {{ .Values.rollout.canary.analysis.interval }}
+      # Tolerate this many consecutive breaches before aborting; absorbs a
+      # single scrape blip without ignoring a genuine regression.
+      failureLimit: {{ .Values.rollout.canary.analysis.failureLimit }}
+      # Wait for enough traffic to make the ratio meaningful. Without this,
+      # the first measurement runs on ~zero requests and 0/0 aborts a healthy
+      # rollout.
+      initialDelay: 60s
+      successCondition: result[0] >= {{ .Values.rollout.canary.analysis.successRateThreshold }}
+      provider:
+        prometheus:
+          address: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(irate(
+              http_server_requests_seconds_count{
+                kubernetes_namespace="{{`{{args.namespace}}`}}",
+                service="{{`{{args.service-name}}`}}",
+                status!~"5.."
+              }[2m]
+            ))
+            /
+            sum(irate(
+              http_server_requests_seconds_count{
+                kubernetes_namespace="{{`{{args.namespace}}`}}",
+                service="{{`{{args.service-name}}`}}"
+              }[2m]
+            ))
+
+    # ---- Metric 2: p95 latency --------------------------------------------
+    # A version can return 200s and still be unusably slow. Latency catches
+    # the regressions the success rate misses.
+    - name: latency-p95
+      interval: {{ .Values.rollout.canary.analysis.interval }}
+      failureLimit: {{ .Values.rollout.canary.analysis.failureLimit }}
+      initialDelay: 60s
+      successCondition: result[0] <= {{ .Values.rollout.canary.analysis.latencyP95Threshold }}
+      provider:
+        prometheus:
+          address: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.95,
+              sum(irate(
+                http_server_requests_seconds_bucket{
+                  kubernetes_namespace="{{`{{args.namespace}}`}}",
+                  service="{{`{{args.service-name}}`}}"
+                }[2m]
+              )) by (le)
+            )
+{{- end }}

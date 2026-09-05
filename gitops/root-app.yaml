@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------------
+# ArgoCD Application — the GitOps entry point.
+#
+# ArgoCD polls this repository, renders chart/ with gitops/application-values.yaml,
+# and reconciles the cluster to match. It is the SOLE writer of application
+# state in the cluster.
+#
+# __REPO_URL__ is substituted by the configure stage with the real repo URL
+# (which is only known at deploy time).
+# ---------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: springboot-app
+  namespace: argocd
+  finalizers:
+    # Ensures deleting this Application also removes the resources it created,
+    # instead of orphaning them in the cluster.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: __REPO_URL__
+    targetRevision: main
+    path: chart
+    helm:
+      valueFiles:
+        # Layered on top of chart/values.yaml. CI updates ONLY this file.
+        - ../gitops/application-values.yaml
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: springboot-app
+
+  syncPolicy:
+    automated:
+      # Delete resources removed from Git — no silent drift from orphans.
+      prune: true
+      # Revert manual kubectl edits. This is what makes Git authoritative:
+      # someone hand-patching the cluster gets reverted within minutes.
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # Server-side apply handles the large CRDs Argo Rollouts registers
+      # without hitting the client-side annotation size limit.
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m
+
+  # Argo Rollouts mutates replica counts during a rollout. Without this,
+  # ArgoCD would see the change as drift and fight the rollouts controller —
+  # the classic "two controllers, one field" flap.
+  ignoreDifferences:
+    - group: argoproj.io
+      kind: Rollout
+      jsonPointers:
+        - /spec/replicas
+
+  revisionHistoryLimit: 10

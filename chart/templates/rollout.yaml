@@ -1,0 +1,145 @@
+# Argo Rollouts Rollout — replaces a standard Deployment.
+#
+# Identical pod spec to a Deployment, but the CONTROLLER understands
+# progressive strategies: it creates a new ReplicaSet, shifts traffic in
+# measured steps, queries Prometheus between steps, and aborts automatically
+# when the new version misbehaves.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 5
+
+  selector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+
+  strategy:
+    {{- if eq .Values.rollout.strategy "blueGreen" }}
+    # BLUE/GREEN: the green stack is fully deployed and reachable on the
+    # preview service. Promotion switches the active service in one step.
+    blueGreen:
+      activeService: {{ include "app.fullname" . }}
+      previewService: {{ include "app.fullname" . }}-preview
+      autoPromotionEnabled: {{ .Values.rollout.blueGreen.autoPromotionEnabled }}
+      scaleDownDelaySeconds: {{ .Values.rollout.blueGreen.scaleDownDelaySeconds }}
+      {{- if .Values.rollout.canary.analysis.enabled }}
+      # Analysis runs against the PREVIEW service before any production
+      # traffic is switched — bad versions never reach users.
+      prePromotionAnalysis:
+        templates:
+          - templateName: {{ include "app.fullname" . }}-success-rate
+        args:
+          - name: service-name
+            value: {{ include "app.fullname" . }}-preview
+          - name: namespace
+            value: {{ .Release.Namespace }}
+      {{- end }}
+    {{- else }}
+    # CANARY: incremental traffic shift with analysis between steps.
+    canary:
+      canaryService: {{ include "app.fullname" . }}-canary
+      stableService: {{ include "app.fullname" . }}
+      trafficRouting:
+        alb:
+          ingress: {{ include "app.fullname" . }}
+          servicePort: {{ .Values.service.port }}
+      {{- if .Values.rollout.canary.analysis.enabled }}
+      # Background analysis starts at step 2 (after the first traffic slice)
+      # and runs for the whole rollout. A breach aborts immediately rather
+      # than waiting for the next pause to end.
+      analysis:
+        templates:
+          - templateName: {{ include "app.fullname" . }}-success-rate
+        startingStep: 2
+        args:
+          - name: service-name
+            value: {{ include "app.fullname" . }}-canary
+          - name: namespace
+            value: {{ .Release.Namespace }}
+      {{- end }}
+      steps:
+        {{- toYaml .Values.rollout.canary.steps | nindent 8 }}
+    {{- end }}
+
+  template:
+    metadata:
+      labels:
+        {{- include "app.selectorLabels" . | nindent 8 }}
+        {{- include "app.labels" . | nindent 8 }}
+      annotations:
+        # Changing tag => changing annotation => new ReplicaSet, guaranteeing
+        # the rollout triggers even if nothing else in the pod spec changed.
+        rollout.image-tag: {{ .Values.image.tag | quote }}
+    spec:
+      serviceAccountName: {{ include "app.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          env:
+            - name: APP_IMAGE_TAG
+              value: {{ .Values.image.tag | quote }}
+            # Surfaces the pod name on the landing page so you can see which
+            # replica answered during a rollout.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+
+          # STARTUP probe: gives the JVM up to 100s (20 x 5s) to boot without
+          # a slow start being mistaken for a crash. Liveness only begins
+          # after this succeeds — this is what stops JVM apps from
+          # CrashLoopBackOff-ing on cold start under load.
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 20
+
+          # LIVENESS: process is wedged -> restart it.
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # READINESS: gates traffic. Failing readiness removes the pod from
+          # the load balancer WITHOUT restarting it.
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          # readOnlyRootFilesystem is on, so every writable path is an
+          # explicit emptyDir. The JVM needs /tmp for its own scratch files.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

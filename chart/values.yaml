@@ -1,0 +1,117 @@
+# Default values. Environment-specific overrides live in
+# gitops/application-values.yaml, which ArgoCD layers on top and which CI
+# updates with each new image tag.
+
+replicaCount: 3
+
+image:
+  # Overwritten by CI with the ECR repository URL from terraform output.
+  repository: PLACEHOLDER_ECR_REPOSITORY
+  # Always an explicit commit SHA — never "latest". A mutable tag makes it
+  # impossible to know which code is serving traffic, and breaks rollback.
+  tag: PLACEHOLDER_IMAGE_TAG
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: "springboot-app"
+
+serviceAccount:
+  create: true
+  name: ""
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    # IP mode targets pods directly, which is what lets Argo Rollouts shift
+    # traffic at pod granularity for canary steps.
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /actuator/health/readiness
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/success-codes: "200"
+  hosts:
+    - host: ""
+      paths:
+        - path: /
+          pathType: Prefix
+
+resources:
+  requests:
+    # The JVM needs a real floor; under-requesting causes OOMKills that look
+    # like random crashes. 512Mi request / 1Gi limit suits this service on
+    # t3.medium nodes (2 vCPU, 4Gi).
+    memory: 512Mi
+    cpu: 250m
+  limits:
+    # Memory limit only. A CPU limit throttles the JVM during startup and makes
+    # readiness probes flap on slow boots.
+    memory: 1Gi
+
+# --- Progressive delivery ---------------------------------------------------
+rollout:
+  # "canary" or "blueGreen".
+  strategy: canary
+
+  canary:
+    # Traffic percentage per step; each pause is analyzed against Prometheus.
+    steps:
+      - setWeight: 20
+      - pause: { duration: 2m }
+      - setWeight: 40
+      - pause: { duration: 2m }
+      - setWeight: 60
+      - pause: { duration: 2m }
+      - setWeight: 80
+      - pause: { duration: 1m }
+    analysis:
+      enabled: true
+      # Abort if the success rate over the interval falls below this.
+      successRateThreshold: "0.95"
+      # Abort if p95 latency exceeds this many seconds.
+      latencyP95Threshold: "1.5"
+      interval: 60s
+      # Consecutive failed measurements before aborting.
+      failureLimit: 2
+
+  blueGreen:
+    # false = a human promotes via `kubectl argo rollouts promote`.
+    # true  = promote automatically after prePromotionAnalysis passes.
+    autoPromotionEnabled: false
+    # Keep the old ReplicaSet alive this long after promotion so a rollback is
+    # instant rather than a fresh rollout.
+    scaleDownDelaySeconds: 300
+
+# Prometheus ServiceMonitor so kube-prometheus-stack scrapes the app.
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  path: /actuator/prometheus
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Must exceed spring.lifecycle.timeout-per-shutdown-phase (25s) so graceful
+# shutdown completes before SIGKILL.
+terminationGracePeriodSeconds: 40
+
+env:
+  SPRING_PROFILES_ACTIVE: kubernetes

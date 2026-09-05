@@ -1,0 +1,36 @@
+# udap:meta cloud=aws region=us-east-1 target=eks
+
+dev: Developer { shape: person; udap-type: generic.user }
+user: End User { shape: person; udap-type: generic.user }
+github: GitHub Monorepo { udap-type: generic.app }
+actions: GitHub Actions CI { udap-type: generic.app }
+oidc: GitHub OIDC Provider (IAM) { udap-type: aws.iam }
+ecr: ECR Image Registry { udap-type: aws.ecr }
+vpc: VPC 10.0.0.0/16 (3 AZ) {
+  alb: Application Load Balancer { udap-type: aws.alb }
+  nat: NAT Gateway (single) { udap-type: aws.nat }
+  eks: EKS Control Plane 1.33 { udap-type: aws.eks }
+  nodes: Managed Node Group (t3.medium x2) { udap-type: aws.ec2 }
+  argocd: ArgoCD { udap-type: generic.app }
+  rollouts: Argo Rollouts Controller { udap-type: generic.app }
+  app: Spring Boot Rollout (blue/green + canary) { udap-type: generic.app }
+  prometheus: Prometheus { udap-type: generic.app }
+  grafana: Grafana { udap-type: generic.app }
+}
+
+dev -> github: push code
+github -> actions: workflow dispatch (path-filtered)
+actions -> oidc: assume role (no static keys)
+oidc -> ecr: authorize push
+actions -> ecr: push image (sha tag)
+actions -> github: bump gitops image tag [skip ci]
+github -> vpc.argocd: poll desired state
+vpc.argocd -> vpc.app: sync manifests (sole cluster writer)
+vpc.rollouts -> vpc.app: manage blue/green + canary steps
+vpc.nodes -> ecr: pull image
+vpc.nodes -> vpc.nat: egress
+user -> vpc.alb: HTTPS
+vpc.alb -> vpc.app: route traffic
+vpc.prometheus -> vpc.app: scrape /actuator/prometheus
+vpc.rollouts -> vpc.prometheus: query canary analysis
+vpc.grafana -> vpc.prometheus: query metrics

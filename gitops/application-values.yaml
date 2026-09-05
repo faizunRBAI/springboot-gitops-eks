@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# THE HANDOFF POINT between CI and GitOps.
+#
+# This is the ONLY file the CI pipeline writes to, and the only application
+# input ArgoCD watches. CI pushes an image to ECR and updates image.tag here;
+# ArgoCD notices the commit and reconciles the cluster.
+#
+# LOOP PREVENTION — three independent layers, all required:
+#   1. CI's commit message contains [skip ci].
+#   2. The deploy workflow ignores changes under gitops/**.
+#   3. CI holds no cluster credentials for application deployment.
+# Removing any one of these still leaves two; do not treat them as redundant.
+#
+# image.repository is set once from `terraform output -raw ecr_repository_url`.
+# image.tag is rewritten by CI on every delivery.
+# ---------------------------------------------------------------------------
+
+image:
+  repository: PLACEHOLDER_ECR_REPOSITORY
+  tag: PLACEHOLDER_IMAGE_TAG
+
+replicaCount: 3
+
+rollout:
+  # Switch to blueGreen for instant-cutover releases; canary is the default
+  # because it limits blast radius to the current traffic weight.
+  strategy: canary
+
+  canary:
+    analysis:
+      enabled: true
+      successRateThreshold: "0.95"
+      latencyP95Threshold: "1.5"
+      interval: 60s
+      failureLimit: 2
+
+ingress:
+  enabled: true
+
+resources:
+  requests:
+    memory: 512Mi
+    cpu: 250m
+  limits:
+    memory: 1Gi
