@@ -24,105 +24,40 @@ jobs:
         working-directory: infra
         run: "set -euo pipefail\nregion=\"${AWS_REGION:-}\"\ncompat=\"\"\nif [ -n \"${AWS_ENDPOINT_URL_S3:-}\" ]; then\n  host=\"${AWS_ENDPOINT_URL_S3#https://}\"\n  region=\"${host%%.*}\"\n  compat=\"-backend-config=skip_credentials_validation=true -backend-config=skip_requesting_account_id=true -backend-config=skip_metadata_api_check=true -backend-config=skip_region_validation=true -backend-config=skip_s3_checksum=true -backend-config=use_path_style=true\"\nfi\nterraform init -input=false -reconfigure \\\n  -backend-config=\"bucket=${{ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"key=${{ secrets.PROJECT_NAME }}/terraform.tfstate\" \\\n  -backend-config=\"region=${region}\" $compat"
     # ------------------------------------------------------------------
-    # DELETE THE KUBERNETES-OWNED AWS RESOURCES BEFORE TERRAFORM RUNS.
+    # DRAIN THE CONTROLLER-MANAGED LOAD BALANCERS *BEFORE* TERRAFORM RUNS.
     #
-    # The ALBs fronting ArgoCD (gitops/argocd-ingress.yaml) and the app
-    # (chart/templates/ingress.yaml) are created by the AWS Load Balancer
-    # Controller, NOT by terraform, so they are absent from state. If they
-    # survive into `terraform destroy`, the EKS cluster is deleted first,
-    # the controller dies before it can deprovision them, and their ENIs
-    # stay attached to the public subnets. Subnet deletion and internet
-    # gateway detachment then fail with DependencyViolation and terraform
-    # retries "Still destroying..." until the job hits its timeout.
+    # The three internet-facing ALBs in this stack (argocd, monitoring and the
+    # application ingress) are created by the AWS Load Balancer Controller
+    # running INSIDE the cluster. Terraform does not know about them, their
+    # ENIs, or the security groups the controller creates for them.
     #
-    # Deleting the Ingress objects lets the still-running controller remove
-    # its own ALBs, target groups and security groups cleanly. Every command
-    # tolerates failure: the cluster may already be gone, or this may be a
-    # re-run after a previous destroy was cancelled part-way through.
+    # A bare `terraform destroy` deletes the node group and control plane
+    # first, which kills the only component capable of deleting those ALBs.
+    # The orphaned ALB ENIs then hold the public subnets and the internet
+    # gateway open forever, and the destroy hangs on
+    #   aws_subnet.public[*]: Still destroying... [19m00s elapsed]
+    #   aws_internet_gateway.main: Still destroying... [19m00s elapsed]
+    # until the job is cancelled.
+    #
+    # Deleting the Ingress/Service objects while the controller is still
+    # alive makes it tear its own ALBs down cleanly, releasing the ENIs.
+    # Every step here is best-effort: a partially-destroyed or already-gone
+    # cluster must not block the terraform destroy that follows.
     # ------------------------------------------------------------------
-      - name: Release the load balancers created by Kubernetes
+      - name: Delete controller-managed load balancers
+        timeout-minutes: 20
+        working-directory: infra
+        run: "set -uo pipefail\nCLUSTER=$(terraform output -raw cluster_name 2>/dev/null || echo \"\")\nVPC_ID=$(terraform output -raw vpc_id 2>/dev/null || echo \"\")\nif [ -z \"${CLUSTER}\" ]; then\n  echo \"No cluster in state; nothing to drain.\"\n  exit 0\nfi\nif ! aws eks describe-cluster --name \"${CLUSTER}\" --region \"${AWS_REGION}\" >/dev/null 2>&1; then\n  echo \"Cluster ${CLUSTER} no longer exists; nothing to drain.\"\n  exit 0\nfi\naws eks update-kubeconfig --name \"${CLUSTER}\" --region \"${AWS_REGION}\" || exit 0\n\n# Ingresses own the ALBs; LoadBalancer Services own any NLBs.\necho \"--- deleting Ingress objects ---\"\nkubectl delete ingress --all --all-namespaces --ignore-not-found=true --timeout=5m || true\necho \"--- deleting LoadBalancer Services ---\"\nkubectl get svc --all-namespaces \\\n  -o jsonpath='{range .items[?(@.spec.type==\"LoadBalancer\")]}{.metadata.namespace}{\" \"}{.metadata.name}{\"\\n\"}{end}' 2>/dev/null \\\n  | while read -r ns name; do\n      [ -n \"${ns:-}\" ] || continue\n      echo \"deleting svc ${ns}/${name}\"\n      kubectl -n \"${ns}\" delete svc \"${name}\" --ignore-not-found=true --timeout=5m || true\n    done\n\n# The controller deletes the ALB asynchronously after the object goes away.\n# Terraform must not start until AWS reports the ENIs released.\nif [ -n \"${VPC_ID}\" ]; then\n  echo \"--- waiting for load balancers in ${VPC_ID} to disappear ---\"\n  for i in $(seq 1 60); do\n    COUNT=$(aws elbv2 describe-load-balancers --region \"${AWS_REGION}\" \\\n      --query \"length(LoadBalancers[?VpcId=='${VPC_ID}'])\" --output text 2>/dev/null || echo 0)\n    CLASSIC=$(aws elb describe-load-balancers --region \"${AWS_REGION}\" \\\n      --query \"length(LoadBalancerDescriptions[?VPCId=='${VPC_ID}'])\" --output text 2>/dev/null || echo 0)\n    if [ \"${COUNT}\" = \"0\" ] && [ \"${CLASSIC}\" = \"0\" ]; then\n      echo \"All load balancers in ${VPC_ID} are gone.\"\n      break\n    fi\n    echo \"attempt ${i}: ${COUNT} ALB/NLB + ${CLASSIC} classic still present; waiting\"\n    sleep 10\n  done\nfi\nexit 0"
+    # ------------------------------------------------------------------
+    # Safety net for a VPC left dirty by a PREVIOUS cancelled destroy, where
+    # the cluster (and therefore the controller) is already gone and the
+    # drain above could not run. Releases only leftover load-balancer ENIs
+    # and the controller's own security groups inside this VPC.
+    # ------------------------------------------------------------------
+      - name: Sweep orphaned load balancer ENIs and security groups
         timeout-minutes: 15
-        run: |
-          set -uo pipefail
-
-          VPC_ID="$(terraform -chdir=infra output -raw vpc_id 2>/dev/null || echo "")"
-          CLUSTER="$(terraform -chdir=infra output -raw cluster_name 2>/dev/null || echo "")"
-
-          if [ -z "${VPC_ID}" ]; then
-            echo "No vpc_id in state; nothing provisioned or already destroyed."
-            exit 0
-          fi
-          echo "Cleaning Kubernetes-created resources in ${VPC_ID}."
-
-          # 1. Ask the controller to deprovision its own ALBs, by deleting the
-          #    Ingress objects while it is still running.
-          if [ -n "${CLUSTER}" ] && aws eks describe-cluster --name "${CLUSTER}" \
-               --region "${AWS_REGION}" >/dev/null 2>&1; then
-            if aws eks update-kubeconfig --name "${CLUSTER}" --region "${AWS_REGION}"; then
-              kubectl delete ingress --all --all-namespaces --timeout=5m || true
-              # Any type=LoadBalancer Service would strand an NLB the same way.
-              kubectl delete svc --all-namespaces \
-                --field-selector spec.type=LoadBalancer --timeout=5m || true
-              echo "Waiting for the controller to finish deprovisioning."
-              sleep 60
-            fi
-          else
-            echo "Cluster absent; falling back to the direct AWS sweep."
-          fi
-
-          # 2. Sweep anything the controller did not remove (it may already have
-          #    been torn down by a previous cancelled destroy).
-          for ARN in $(aws elbv2 describe-load-balancers --region "${AWS_REGION}" \
-                --query "LoadBalancers[?VpcId=='${VPC_ID}'].LoadBalancerArn" \
-                --output text 2>/dev/null); do
-            echo "Deleting load balancer ${ARN}"
-            aws elbv2 delete-load-balancer --load-balancer-arn "${ARN}" \
-              --region "${AWS_REGION}" || true
-          done
-
-          for NAME in $(aws elb describe-load-balancers --region "${AWS_REGION}" \
-                --query "LoadBalancerDescriptions[?VPCId=='${VPC_ID}'].LoadBalancerName" \
-                --output text 2>/dev/null); do
-            echo "Deleting classic load balancer ${NAME}"
-            aws elb delete-load-balancer --load-balancer-name "${NAME}" \
-              --region "${AWS_REGION}" || true
-          done
-
-          for TG in $(aws elbv2 describe-target-groups --region "${AWS_REGION}" \
-                --query "TargetGroups[?VpcId=='${VPC_ID}'].TargetGroupArn" \
-                --output text 2>/dev/null); do
-            aws elbv2 delete-target-group --target-group-arn "${TG}" \
-              --region "${AWS_REGION}" || true
-          done
-
-          # 3. Load balancer ENIs are removed asynchronously; the subnets cannot
-          #    be deleted until they are gone. Wait for them rather than letting
-          #    terraform discover the DependencyViolation and spin.
-          for i in $(seq 1 40); do
-            LEFT=$(aws ec2 describe-network-interfaces --region "${AWS_REGION}" \
-              --filters "Name=vpc-id,Values=${VPC_ID}" \
-                        "Name=description,Values=ELB *" \
-              --query 'length(NetworkInterfaces)' --output text 2>/dev/null || echo 0)
-            if [ "${LEFT}" = "0" ]; then
-              echo "All load balancer ENIs released."
-              break
-            fi
-            echo "attempt ${i}: ${LEFT} load balancer ENI(s) still attached; waiting"
-            sleep 15
-          done
-
-          # 4. Security groups the controller created for those ALBs are also
-          #    outside terraform state and hold the VPC open.
-          for SG in $(aws ec2 describe-security-groups --region "${AWS_REGION}" \
-                --filters "Name=vpc-id,Values=${VPC_ID}" \
-                          "Name=tag-key,Values=elbv2.k8s.aws/cluster" \
-                --query 'SecurityGroups[].GroupId' --output text 2>/dev/null); do
-            echo "Deleting controller-managed security group ${SG}"
-            aws ec2 delete-security-group --group-id "${SG}" \
-              --region "${AWS_REGION}" || true
-          done
-
-          echo "Kubernetes-owned resources released; terraform can now proceed."
+        working-directory: infra
+        run: "set -uo pipefail\nVPC_ID=$(terraform output -raw vpc_id 2>/dev/null || echo \"\")\nif [ -z \"${VPC_ID}\" ]; then\n  echo \"No VPC in state; nothing to sweep.\"\n  exit 0\nfi\n\necho \"--- detaching/deleting orphaned ELB network interfaces in ${VPC_ID} ---\"\naws ec2 describe-network-interfaces --region \"${AWS_REGION}\" \\\n  --filters \"Name=vpc-id,Values=${VPC_ID}\" \"Name=description,Values=ELB*\" \\\n  --query 'NetworkInterfaces[].[NetworkInterfaceId,Attachment.AttachmentId,Status]' \\\n  --output text 2>/dev/null \\\n  | while read -r eni attach status; do\n      [ -n \"${eni:-}\" ] || continue\n      echo \"orphan ENI ${eni} (${status})\"\n      if [ -n \"${attach:-}\" ] && [ \"${attach}\" != \"None\" ]; then\n        aws ec2 detach-network-interface --region \"${AWS_REGION}\" \\\n          --attachment-id \"${attach}\" --force || true\n        sleep 10\n      fi\n      aws ec2 delete-network-interface --region \"${AWS_REGION}\" \\\n        --network-interface-id \"${eni}\" || true\n    done\n\n# Controller-created SGs are tagged with the cluster they belong to. They are not in\n# terraform state, so terraform never removes them and the VPC cannot go.\necho \"--- deleting controller-managed security groups in ${VPC_ID} ---\"\nfor attempt in 1 2 3; do\n  REMAINING=0\n  for sg in $(aws ec2 describe-security-groups --region \"${AWS_REGION}\" \\\n    --filters \"Name=vpc-id,Values=${VPC_ID}\" \\\n              \"Name=tag-key,Values=elbv2.k8s.aws/cluster\" \\\n    --query 'SecurityGroups[].GroupId' --output text 2>/dev/null); do\n    echo \"deleting security group ${sg} (attempt ${attempt})\"\n    aws ec2 delete-security-group --region \"${AWS_REGION}\" --group-id \"${sg}\" || REMAINING=1\n  done\n  [ \"${REMAINING}\" = \"0\" ] && break\n  sleep 15\ndone\nexit 0"
       - name: Terraform destroy
         working-directory: infra
-        run: terraform destroy -input=false -auto-approve
+        run: "set -euo pipefail\nterraform destroy -input=false -auto-approve"
