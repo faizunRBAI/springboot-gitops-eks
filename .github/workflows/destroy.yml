@@ -58,6 +58,32 @@ jobs:
         timeout-minutes: 15
         working-directory: infra
         run: "set -uo pipefail\nVPC_ID=$(terraform output -raw vpc_id 2>/dev/null || echo \"\")\nif [ -z \"${VPC_ID}\" ]; then\n  echo \"No VPC in state; nothing to sweep.\"\n  exit 0\nfi\n\necho \"--- detaching/deleting orphaned ELB network interfaces in ${VPC_ID} ---\"\naws ec2 describe-network-interfaces --region \"${AWS_REGION}\" \\\n  --filters \"Name=vpc-id,Values=${VPC_ID}\" \"Name=description,Values=ELB*\" \\\n  --query 'NetworkInterfaces[].[NetworkInterfaceId,Attachment.AttachmentId,Status]' \\\n  --output text 2>/dev/null \\\n  | while read -r eni attach status; do\n      [ -n \"${eni:-}\" ] || continue\n      echo \"orphan ENI ${eni} (${status})\"\n      if [ -n \"${attach:-}\" ] && [ \"${attach}\" != \"None\" ]; then\n        aws ec2 detach-network-interface --region \"${AWS_REGION}\" \\\n          --attachment-id \"${attach}\" --force || true\n        sleep 10\n      fi\n      aws ec2 delete-network-interface --region \"${AWS_REGION}\" \\\n        --network-interface-id \"${eni}\" || true\n    done\n\n# Controller-created SGs are tagged with the cluster they belong to. They are not in\n# terraform state, so terraform never removes them and the VPC cannot go.\necho \"--- deleting controller-managed security groups in ${VPC_ID} ---\"\nfor attempt in 1 2 3; do\n  REMAINING=0\n  for sg in $(aws ec2 describe-security-groups --region \"${AWS_REGION}\" \\\n    --filters \"Name=vpc-id,Values=${VPC_ID}\" \\\n              \"Name=tag-key,Values=elbv2.k8s.aws/cluster\" \\\n    --query 'SecurityGroups[].GroupId' --output text 2>/dev/null); do\n    echo \"deleting security group ${sg} (attempt ${attempt})\"\n    aws ec2 delete-security-group --region \"${AWS_REGION}\" --group-id \"${sg}\" || REMAINING=1\n  done\n  [ \"${REMAINING}\" = \"0\" ] && break\n  sleep 15\ndone\nexit 0"
+    # ------------------------------------------------------------------
+    # EMPTY THE ECR REPOSITORY *BEFORE* TERRAFORM RUNS.
+    #
+    # `force_delete = true` in infra/ecr.tf is a TERRAFORM-SIDE-ONLY flag: it
+    # has no representation in the ECR API. During `terraform destroy` the
+    # provider reads force_delete from the PRIOR STATE, not from the current
+    # configuration. A repository that was applied BEFORE that line was added
+    # still carries force_delete=false in state, so the provider issues a plain
+    # DeleteRepository and AWS rejects it:
+    #   Error: ECR Repository (...) not empty, consider using force_delete
+    #   RepositoryNotEmptyException: ... it still contains images
+    # A plain destroy never refreshes that flag, so editing the .tf alone can
+    # never clear this on an existing stack.
+    #
+    # Two belts, one brace:
+    #  1. A TARGETED APPLY on just the ECR resource writes force_delete=true
+    #     into state, so the subsequent destroy uses the forced code path.
+    #  2. Batch-deleting every image makes the repository empty, so even the
+    #     unforced DeleteRepository path succeeds.
+    # Best-effort throughout: an already-gone repository must not block the
+    # terraform destroy that follows.
+    # ------------------------------------------------------------------
+      - name: Empty the ECR repository
+        timeout-minutes: 15
+        working-directory: infra
+        run: "set -uo pipefail\nREPO=\"${TF_VAR_project_name:-}\"\nif [ -z \"${REPO}\" ]; then\n  echo \"PROJECT_NAME is empty; cannot resolve the ECR repository name.\"\n  exit 0\nfi\nif ! aws ecr describe-repositories --region \"${AWS_REGION}\" \\\n     --repository-names \"${REPO}\" >/dev/null 2>&1; then\n  echo \"ECR repository ${REPO} does not exist; nothing to empty.\"\n  exit 0\nfi\n\n# 1. Reconcile force_delete=true into terraform state. Without this the\n#    destroy plan replays force_delete=false from the prior state.\necho \"--- reconciling force_delete into state for aws_ecr_repository.app ---\"\nterraform apply -input=false -auto-approve -target=aws_ecr_repository.app || \\\n  echo \"targeted apply failed; relying on emptying the repository instead.\"\n\n# 2. Delete every image so an unforced DeleteRepository also succeeds.\n#    batch-delete-image takes at most 100 ids per call, so loop until empty.\necho \"--- deleting all images in ${REPO} ---\"\nfor attempt in $(seq 1 50); do\n  IDS=$(aws ecr list-images --region \"${AWS_REGION}\" \\\n    --repository-name \"${REPO}\" --max-items 100 \\\n    --query 'imageIds[*]' --output json 2>/dev/null || echo '[]')\n  if [ -z \"${IDS}\" ] || [ \"${IDS}\" = '[]' ] || [ \"${IDS}\" = 'null' ]; then\n    echo \"Repository ${REPO} is empty.\"\n    break\n  fi\n  echo \"batch ${attempt}: deleting up to 100 images\"\n  aws ecr batch-delete-image --region \"${AWS_REGION}\" \\\n    --repository-name \"${REPO}\" --image-ids \"${IDS}\" >/dev/null 2>&1 || true\ndone\n\nREMAINING=$(aws ecr list-images --region \"${AWS_REGION}\" \\\n  --repository-name \"${REPO}\" --query 'length(imageIds)' --output text 2>/dev/null || echo 0)\necho \"images remaining in ${REPO}: ${REMAINING}\"\nexit 0"
       - name: Terraform destroy
         working-directory: infra
         run: "set -euo pipefail\nterraform destroy -input=false -auto-approve"
