@@ -1,6 +1,10 @@
 resource "aws_ecr_repository" "app" {
   name = var.project_name
 
+  # Destroy must not stall on stored images; SHA-tagged images accumulate and
+  # are recreated by the delivery pipeline.
+  force_delete = true
+
   # Tags stay mutable so a rebuild of the same SHA can overwrite; the delivery
   # path always deploys an explicit SHA tag, never :latest.
   image_tag_mutability = "MUTABLE"
