@@ -14,16 +14,115 @@ jobs:
       TF_VAR_region: us-east-1
       TF_VAR_github_repo: ${{ github.repository }}
     steps:
-    - uses: actions/checkout@v4
-    - uses: hashicorp/setup-terraform@v3
-    - name: Terraform destroy
-      working-directory: infra
-      run: "set -euo pipefail\nregion=\"${AWS_REGION:-}\"\ncompat=\"\"\nif [ -n \"\
-        ${AWS_ENDPOINT_URL_S3:-}\" ]; then\n  host=\"${AWS_ENDPOINT_URL_S3#https://}\"\
-        \n  region=\"${host%%.*}\"\n  compat=\"-backend-config=skip_credentials_validation=true\
-        \ -backend-config=skip_requesting_account_id=true -backend-config=skip_metadata_api_check=true\
-        \ -backend-config=skip_region_validation=true -backend-config=skip_s3_checksum=true\
-        \ -backend-config=use_path_style=true\"\nfi\nterraform init -input=false -reconfigure\
-        \ \\\n  -backend-config=\"bucket=${{ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"\
-        key=${{ secrets.PROJECT_NAME }}/terraform.tfstate\" \\\n  -backend-config=\"\
-        region=${region}\" $compat\nterraform destroy -input=false -auto-approve"
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.33.0
+      - name: Terraform init
+        working-directory: infra
+        run: "set -euo pipefail\nregion=\"${AWS_REGION:-}\"\ncompat=\"\"\nif [ -n \"${AWS_ENDPOINT_URL_S3:-}\" ]; then\n  host=\"${AWS_ENDPOINT_URL_S3#https://}\"\n  region=\"${host%%.*}\"\n  compat=\"-backend-config=skip_credentials_validation=true -backend-config=skip_requesting_account_id=true -backend-config=skip_metadata_api_check=true -backend-config=skip_region_validation=true -backend-config=skip_s3_checksum=true -backend-config=use_path_style=true\"\nfi\nterraform init -input=false -reconfigure \\\n  -backend-config=\"bucket=${{ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"key=${{ secrets.PROJECT_NAME }}/terraform.tfstate\" \\\n  -backend-config=\"region=${region}\" $compat"
+    # ------------------------------------------------------------------
+    # DELETE THE KUBERNETES-OWNED AWS RESOURCES BEFORE TERRAFORM RUNS.
+    #
+    # The ALBs fronting ArgoCD (gitops/argocd-ingress.yaml) and the app
+    # (chart/templates/ingress.yaml) are created by the AWS Load Balancer
+    # Controller, NOT by terraform, so they are absent from state. If they
+    # survive into `terraform destroy`, the EKS cluster is deleted first,
+    # the controller dies before it can deprovision them, and their ENIs
+    # stay attached to the public subnets. Subnet deletion and internet
+    # gateway detachment then fail with DependencyViolation and terraform
+    # retries "Still destroying..." until the job hits its timeout.
+    #
+    # Deleting the Ingress objects lets the still-running controller remove
+    # its own ALBs, target groups and security groups cleanly. Every command
+    # tolerates failure: the cluster may already be gone, or this may be a
+    # re-run after a previous destroy was cancelled part-way through.
+    # ------------------------------------------------------------------
+      - name: Release the load balancers created by Kubernetes
+        timeout-minutes: 15
+        run: |
+          set -uo pipefail
+
+          VPC_ID="$(terraform -chdir=infra output -raw vpc_id 2>/dev/null || echo "")"
+          CLUSTER="$(terraform -chdir=infra output -raw cluster_name 2>/dev/null || echo "")"
+
+          if [ -z "${VPC_ID}" ]; then
+            echo "No vpc_id in state; nothing provisioned or already destroyed."
+            exit 0
+          fi
+          echo "Cleaning Kubernetes-created resources in ${VPC_ID}."
+
+          # 1. Ask the controller to deprovision its own ALBs, by deleting the
+          #    Ingress objects while it is still running.
+          if [ -n "${CLUSTER}" ] && aws eks describe-cluster --name "${CLUSTER}" \
+               --region "${AWS_REGION}" >/dev/null 2>&1; then
+            if aws eks update-kubeconfig --name "${CLUSTER}" --region "${AWS_REGION}"; then
+              kubectl delete ingress --all --all-namespaces --timeout=5m || true
+              # Any type=LoadBalancer Service would strand an NLB the same way.
+              kubectl delete svc --all-namespaces \
+                --field-selector spec.type=LoadBalancer --timeout=5m || true
+              echo "Waiting for the controller to finish deprovisioning."
+              sleep 60
+            fi
+          else
+            echo "Cluster absent; falling back to the direct AWS sweep."
+          fi
+
+          # 2. Sweep anything the controller did not remove (it may already have
+          #    been torn down by a previous cancelled destroy).
+          for ARN in $(aws elbv2 describe-load-balancers --region "${AWS_REGION}" \
+                --query "LoadBalancers[?VpcId=='${VPC_ID}'].LoadBalancerArn" \
+                --output text 2>/dev/null); do
+            echo "Deleting load balancer ${ARN}"
+            aws elbv2 delete-load-balancer --load-balancer-arn "${ARN}" \
+              --region "${AWS_REGION}" || true
+          done
+
+          for NAME in $(aws elb describe-load-balancers --region "${AWS_REGION}" \
+                --query "LoadBalancerDescriptions[?VPCId=='${VPC_ID}'].LoadBalancerName" \
+                --output text 2>/dev/null); do
+            echo "Deleting classic load balancer ${NAME}"
+            aws elb delete-load-balancer --load-balancer-name "${NAME}" \
+              --region "${AWS_REGION}" || true
+          done
+
+          for TG in $(aws elbv2 describe-target-groups --region "${AWS_REGION}" \
+                --query "TargetGroups[?VpcId=='${VPC_ID}'].TargetGroupArn" \
+                --output text 2>/dev/null); do
+            aws elbv2 delete-target-group --target-group-arn "${TG}" \
+              --region "${AWS_REGION}" || true
+          done
+
+          # 3. Load balancer ENIs are removed asynchronously; the subnets cannot
+          #    be deleted until they are gone. Wait for them rather than letting
+          #    terraform discover the DependencyViolation and spin.
+          for i in $(seq 1 40); do
+            LEFT=$(aws ec2 describe-network-interfaces --region "${AWS_REGION}" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+                        "Name=description,Values=ELB *" \
+              --query 'length(NetworkInterfaces)' --output text 2>/dev/null || echo 0)
+            if [ "${LEFT}" = "0" ]; then
+              echo "All load balancer ENIs released."
+              break
+            fi
+            echo "attempt ${i}: ${LEFT} load balancer ENI(s) still attached; waiting"
+            sleep 15
+          done
+
+          # 4. Security groups the controller created for those ALBs are also
+          #    outside terraform state and hold the VPC open.
+          for SG in $(aws ec2 describe-security-groups --region "${AWS_REGION}" \
+                --filters "Name=vpc-id,Values=${VPC_ID}" \
+                          "Name=tag-key,Values=elbv2.k8s.aws/cluster" \
+                --query 'SecurityGroups[].GroupId' --output text 2>/dev/null); do
+            echo "Deleting controller-managed security group ${SG}"
+            aws ec2 delete-security-group --group-id "${SG}" \
+              --region "${AWS_REGION}" || true
+          done
+
+          echo "Kubernetes-owned resources released; terraform can now proceed."
+      - name: Terraform destroy
+        working-directory: infra
+        run: terraform destroy -input=false -auto-approve
